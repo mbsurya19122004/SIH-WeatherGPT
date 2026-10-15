@@ -213,6 +213,19 @@ header.top {
   max-width: 640px;
 }
 
+/* Out-of-scope state: a neutral, non-severity treatment. This must NOT reuse
+   the green tier, because green means "IMD checked and there is no warning"
+   and that is precisely the claim this state is declining to make. */
+.bulletin.tier-none {
+  border-color: var(--line);
+  background: var(--mist);
+  color: var(--muted);
+}
+
+.bulletin.tier-none .bulletin-head {
+  color: var(--muted);
+}
+
 /* Four IMD tiers — the watch color follows the bulletin's severity. */
 .bulletin.tier-green {
   border-color: var(--watch-green);
@@ -709,6 +722,31 @@ header.top {
     padding: 8px 11px;
     font-size: 13px;
   }
+
+  /* P3-012: touch targets at least 44x44 on touch viewports.
+     These controls were 28-33px tall, below the 44px comfortable-target
+     threshold, so they were hard to hit accurately on a phone. min-height
+     (not height) is used so a long label can still grow the control rather
+     than overflowing it. The rail is display:none here, so its 40px desktop
+     buttons are intentionally untouched.
+     
+     `.map-layer-pill` is the map layer switcher, not `.chip` — the two look
+     alike but are separate classes, and the map pills are the ones a user
+     actually taps to change weather layers. */
+  .location-pill,
+  .lang-toggle,
+  .drawer-nav-item,
+  .drawer-close,
+  .rail-toggle,
+  .chip,
+  .map-layer-pill {
+    min-height: 44px;
+  }
+
+  .drawer-close,
+  .rail-toggle {
+    min-width: 44px;
+  }
 }
 
 /* ─── Mobile Drawer (for rail items) ─── */
@@ -1023,4 +1061,20 @@ header.top {
   .app-footer-src {
     width: 100%;
   }
+}
+/* P3-014 · the "saved from your last visit" marker.
+   Must read as an annotation on the pill, not as a second control, so it is
+   aria-hidden (the pill's accessible name already carries the meaning) and
+   styled to sit quietly beside the place name. */
+.location-saved-tag {
+  font-size: 10.5px;
+  line-height: 1;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 3px 5px;
+  border-radius: var(--radius-chip);
+  background: var(--mist);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  flex-shrink: 0;
 }

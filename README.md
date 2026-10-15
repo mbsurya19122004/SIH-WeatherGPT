@@ -691,6 +691,13 @@ Location information can be represented using latitude/longitude and spatial dat
 
 # 🔐 Security & Reliability
 
+**Model output can never alter or soften a weather warning.** The warning
+bulletin renders from IMD data, not from the assistant: it displays the
+official text verbatim, is labelled as verbatim, and takes no model output at
+all. A warning question is also answered by a deterministic lookup that never
+calls the model. The model can put a wrong sentence in the chat, and cannot
+change what you are told to do about a warning.
+
 Weather information can influence important decisions, so the platform should prioritize reliability.
 
 Recommended practices:
@@ -728,46 +735,160 @@ cd WeatherGPT
 
 ## 2. Create Virtual Environment
 
+`start.sh` looks for the virtualenv at **`.venv`** in the project root. Use that
+exact name, or the launcher falls back to the system `python3` and the services
+fail on missing imports.
+
 ```bash
-python -m venv venv
+python3 -m venv .venv
 ```
 
 ### Windows
 
-```bash
-venv\Scripts\activate
+```powershell
+.venv\Scripts\activate
 ```
 
 ### Linux/macOS
 
 ```bash
-source venv/bin/activate
+source .venv/bin/activate
 ```
 
 ## 3. Install Dependencies
 
+There is no root-level `requirements.txt`. Python dependencies live per service,
+and both run from the same `.venv`:
+
 ```bash
-pip install -r requirements.txt
+pip install -r ML/requirements.txt             # AI agent + route weather
+pip install -r voice_service/requirements.txt  # optional, see 3a
 ```
+
+`./start.sh setup` installs both. The second pulls PyTorch, so read 3a first if
+you would rather not pay that cost.
+
+### 3a. Voice service dependencies (opt-in)
+
+The voice service is **optional**. It is a separate Python service that runs
+from the same virtual environment as the ML service, and it needs three extra
+packages:
+
+| Package | Needed for | Notes |
+|---|---|---|
+| `python-multipart` | `/stt/transcribe` request parsing | tiny, pure Python |
+| `openai-whisper` | speech-to-text | **pulls PyTorch — install the CPU build first** |
+| `gTTS` / `pyttsx3` | text-to-speech | small |
+
+**Install torch CPU-only first, then the rest.** This project transcribes CPU
+audio and never uses CUDA, but the default torch pulls multi-gigabyte CUDA
+wheels, and installing it with a download cache failed here with
+`OSError: [Errno 122] Disk quota exceeded` while `df` reported 400 GB+ free:
+
+```bash
+pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch
+pip install --no-cache-dir -r voice_service/requirements.txt
+```
+
+`./start.sh setup` does exactly this, in this order. Transcription also needs a
+system `ffmpeg` on `PATH`; `start.sh` does not install system packages.
+
+**To install them by hand instead:**
+
+```bash
+pip install python-multipart
+pip install -r voice_service/requirements.txt   # includes openai-whisper
+```
+
+**To skip voice entirely** — the rest of the app does not need any of it:
+
+```bash
+pip install python-multipart
+```
+
+With that, the voice service starts and reports its real state instead of
+crashing:
+```bash
+curl -s http://localhost:8001/health
+# {"status":"healthy","voice_enabled":false,"stt_available":false,"tts_available":false}
+```
+
+`stt_available: false` / `tts_available: false` means exactly that — the service
+is up, speech is not. The web app's text, map, forecast and chat features are
+unaffected.
+
+### Enabling voice (off by default, and it downloads a model)
+
+**Voice is disabled by default and stays that way unless you turn it on.** The
+switch is `VOICE_ENABLED`, and leaving it unset means the service runs as a
+no-op: it starts, reports `stt_available: false`, and returns nothing for a
+transcription request. That is deliberate, because turning it on has a cost
+you should choose rather than discover.
+
+To enable it, add this to the project-root `.env`:
+
+```env
+VOICE_ENABLED=true
+```
+
+or export it for one run:
+
+```bash
+VOICE_ENABLED=true ./start.sh
+```
+
+**What enabling it downloads on first use.** The first `/stt/transcribe` request
+loads the Whisper `base` model, which is **roughly 140 MB** fetched from the
+internet into `~/.cache/whisper`. It is a one-time download, but it happens at
+the moment someone first speaks into the app, not at install time. If that is
+not acceptable on a given machine, leave `VOICE_ENABLED` off. TTS via `gTTS`
+also needs internet access at call time; `pyttsx3` is the offline option.
+
+Be deliberate about this before a demo: enabling voice mid-session means the
+first person to use it waits on a ~140 MB download.
 
 ## 4. Configure Environment Variables
 
-Create a `.env` file:
+Create a `.env` file **in the project root**. The ML service loads it on
+startup, so a key placed here is picked up without exporting it in your shell.
+`.env` is gitignored; never commit it.
 
 ```env
-OPENAI_API_KEY=your_api_key
+# Required for the AI chat agent. The provider is OpenRouter, reached through
+# its OpenAI-compatible endpoint. Without this key the chat returns
+# "not configured" and every non-fast-path question fails.
+OPENROUTER_API_KEY=your_openrouter_key
 
-WEATHER_API_KEY=your_weather_api_key
-
-DATABASE_URL=your_database_url
-
-MQTT_BROKER_URL=your_mqtt_broker
+# Optional. Overrides the free-tier default model if you want a different one.
+# LLM_MODEL=google/gemma-4-26b-a4b-it:free
 ```
 
-## 5. Start Backend
+Weather data comes from Open-Meteo and needs no key. Verify what the service
+resolved, without exposing the key:
 
 ```bash
-uvicorn app.main:app --reload
+curl -s http://localhost:8000/health
+# {"status":"ok",...,"model_provider":"openrouter","model_provider_configured":true}
+```
+
+`model_provider_configured: false` means the key was not found, which usually
+means the `.env` is in the wrong directory. A key that is present but rejected
+surfaces as HTTP 502 on `/agent`, not 503.
+
+## 5. Start the Services
+
+The easiest route is the launcher, which starts all four services:
+
+```bash
+./start.sh
+```
+
+To run the Python ML backend on its own, note the entry point is
+`ML/main.py`, so the module is `main` and it must be started from inside `ML/`:
+
+```bash
+cd ML
+../.venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 Backend will be available at:
@@ -775,6 +896,61 @@ Backend will be available at:
 ```text
 http://localhost:8000
 ```
+
+## 6. Running the Tests
+
+### Java backend
+
+```bash
+cd backend && mvn test
+```
+
+Last full run: **140 tests, 0 failures, 0 errors, 0 skipped** across 20 classes.
+
+| Test class | Covers |
+|---|---|
+| `AuthControllerTest` | registration, login, JWT issuance |
+| `JwtTokenProviderTest` | token signing, expiry, validation |
+| `CorsConfigurationTest` | allowed origins and methods |
+| `AlertServiceTest` | alert assembly and filtering |
+| `AlertControllerTest` | alert endpoints |
+| `NoOpAlertProviderTest` | the no-op provider fallback |
+| `ImdEarlyWarningServiceTest` | IMD early-warning parsing |
+| `WeatherServiceTest` | weather aggregation |
+| `WeatherControllerTest` | weather endpoints |
+| `WeatherCoordinateAwareEndpointsTest` | coordinate-first endpoint contract |
+| `WeatherQueryFlowTest` | end-to-end query flow |
+| `WeatherResponseGeneratorTest` | response text generation |
+| `ClimateAnalysisServiceTest` | climate metric generation |
+| `NwpModelServiceTest` | NWP model handling |
+| `SectorAdvisoryServiceTest` | sector advisories |
+| `OpenMeteoGeocodingProviderTest` | geocoding provider |
+| `OpenMeteoWeatherProviderTest` | weather provider |
+| `DeterministicWeatherQueryInterpreterTest` | query interpretation |
+| `LlmQueryUnderstandingServiceTest` | LLM query understanding |
+| `LocalizationServiceTest` | language handling |
+
+### Frontend
+
+```bash
+cd frontend
+npm run typecheck   # tsc -b --noEmit
+npm run lint        # eslint src
+npm test            # node --test ../tests/*.test.ts
+npm run build       # tsc -b && vite build
+```
+
+`npm test` runs the zero-dependency Node test suites in `tests/`
+(`location_core.test.ts`, `radar_core.test.ts`).
+
+### API safety guard
+
+```bash
+./scripts/verify-api-safety.sh
+```
+
+Builds the app under seven `VITE_*` configurations and asserts the effective
+API base URL, so a local session cannot silently reach a deployed service.
 
 ---
 

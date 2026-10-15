@@ -30,3 +30,11 @@ ML/sample_resume-2.pdf
 .serena/cache/
 .serena/project.local.yml
 .serena/memories/
+
+# Tool caches and build artefacts
+.serena/
+.cache/
+__pycache__/
+frontend/probe-dist/
+
+docs/qa-evidence/

@@ -1,0 +1,72 @@
+/*
+ * Mobile touch-target and text-size corrections.
+ *
+ * Both changes are hit-area / platform-behaviour fixes, not a redesign. The
+ * visual size of each control is deliberately left alone: WCAG 2.5.8 (AA) asks
+ * for a 24x24 CSS-pixel target, and the platform convention on phones is
+ * 44x44. Padding delivers the first without making a chip look like a button,
+ * which is why this is padding and pseudo-element expansion rather than
+ * `font-size` on the control.
+ *
+ * Measured before, at 360 / 375 / 390 / 768 / 1440, all identical:
+ *   .lang-opt "EN"  27x23      below the 24px floor
+ *   .lang-opt "hi"  22x23      below the 24px floor
+ *   .app-footer a   73x17      17px tall
+ *   Leaflet attribution links 43x11 / 71x11 (app-styled)
+ */
+
+/* ---------------------------------------------------------------- language */
+.lang-toggle .lang-opt {
+  /* 2px -> 6px vertical padding takes the chip from 23px to 31px tall, and
+     the extra width stops the Devanagari glyph being the tap target. The
+     horizontal padding is symmetric so the two options stay balanced. */
+  padding: 6px 8px;
+  margin: -6px 0; /* absorb the added height: the toggle does not grow */
+}
+
+/* ---------------------------------------------------------------- footer */
+.app-footer a {
+  /* The links sit in a row with 11px type. Vertical padding plus a negative
+     margin keeps the baseline and the footer height exactly as they were while
+     giving each link a 31px-tall target. */
+  padding: 7px 2px;
+  margin: -7px 0;
+  display: inline-block;
+}
+
+/* ------------------------------------------------- Leaflet attribution */
+.leaflet-container .leaflet-control-attribution a {
+  /* OSM requires the attribution to stay visible; it does not require it to be
+     hard to tap. 11px-tall links are a 24px-AA failure in the one place a user
+     most often needs to reach for a link. 6px of vertical padding on an 11px
+     line reaches 23px, so 7px is the minimum that clears the 24px floor; the
+     negative margin keeps the attribution strip the height Leaflet sized it. */
+  display: inline-block;
+  padding: 7px 3px;
+  margin: -7px 0;
+  line-height: 1.1;
+}
+
+/* ---------------------------------------------- form text and zoom on iOS */
+/*
+ * iOS Safari zooms the whole page when a focused input's computed font-size is
+ * under 16px, and the user cannot zoom back out without a pinch. Every form in
+ * this app was at 14px, so filling in the route form or searching for a city on
+ * a phone zoomed the page and left the user scrolled and magnified with no
+ * obvious way back. 16px is the documented threshold, and it is also simply the
+ * right size for a phone input.
+ */
+@media (max-width: 720px) {
+  input,
+  textarea,
+  select {
+    font-size: 16px;
+  }
+
+  /* The route form and the report search set fontSize inline (App.tsx spreads
+     an `S.input` style object), and an inline style beats a stylesheet rule of
+     equal specificity, so those need !important to be reached at all. */
+  input[style*="font-size"] {
+    font-size: 16px !important;
+  }
+}

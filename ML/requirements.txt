@@ -22,7 +22,15 @@ typing-inspection==0.4.4
 typing_extensions==4.16.0
 uvicorn==0.52.4
 langchain>=0.3.0
-langchain-ollama>=0.2.0
 langchain-core>=0.3.0
 requests>=2.31.0
-langchain-openrouter
+langchain-openai>=0.3.0
+# Model provider: OpenRouter, over its OpenAI-compatible endpoint.
+# Requires OPENROUTER_API_KEY in the environment (never committed).
+# The former langchain-ollama dependency was removed: this service no longer
+# runs a local model server.
+
+# Reads OPENROUTER_API_KEY (and any other setting) from the project-root .env
+# file. Without it the service only ever saw the process environment, so a
+# valid .env was silently ignored and /agent answered 503 "not configured".
+python-dotenv>=1.0.0

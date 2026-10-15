@@ -1,21 +1,117 @@
 /**
  * API Configuration
  *
- * Java backend (Spring Boot) → Railway
- * Python ML backend (FastAPI) → Railway
+ * Java backend (Spring Boot)
+ * Python ML backend (FastAPI)
  *
- * In production, requests go directly to the Railway backends.
- * In development, these URLs also work directly, so no Vite proxy
- * is required for these API calls.
+ * Both base URLs are environment-driven and default to LOCALHOST.
+ *
+ * Why this matters: this file previously hardcoded a deployed Railway host, so
+ * a local `npm run dev` session talked to a real deployed service. Every test
+ * run from a developer machine was therefore a production request. Reading the
+ * base from the environment, defaulting to localhost, and requiring an
+ * explicit opt-in flag for the deployed host means a mistake is opt-in rather
+ * than the default.
+ *
+ * Configure with a Vite env var in `frontend/.env.local` (gitignored) or the
+ * shell:
+ *
+ *   VITE_JAVA_API_BASE=http://localhost:8080     # default
+ *   VITE_ML_API_BASE=http://localhost:8000       # default
+ *
+ * To deliberately point a local build at the deployed service, opt in
+ * explicitly:
+ *
+ *   VITE_USE_PRODUCTION_API=true
+ *   VITE_JAVA_API_BASE=https://sih-weathergpt-production.up.railway.app
+ *
+ * The opt-in is separate from the URL on purpose: naming a production host in a
+ * variable should not be enough on its own to start mutating it.
  */
 
 // ── Backend base URLs ────────────────────────────────────────────────
 
-export const JAVA_API_BASE =
-  "https://sih-weathergpt-production.up.railway.app";
+/** Trailing slashes are stripped so path joins never produce a double slash. */
+function normalizeBase(url: string): string {
+  return url.replace(/\/+$/, "");
+}
 
-export const ML_API_BASE =
-  "http://localhost:8000";
+function readEnv(key: string): string | undefined {
+  // `import.meta.env` is a Vite construct and is `undefined` everywhere else:
+  // the Node test runner, plain SSR, or any non-Vite consumer. Reading it
+  // unguarded threw `TypeError: Cannot read properties of undefined`, which
+  // broke `tests/radar_core.test.ts` at import time. The optional chain keeps
+  // the static replacement Vite relies on while making the module safe to
+  // import anywhere; with no env present the local defaults apply.
+  const env = import.meta.env as Record<string, string | undefined> | undefined;
+  // These keys must be written out in full rather than looked up dynamically,
+  // because Vite statically replaces each `import.meta.env.X` expression.
+  const table: Record<string, string | undefined> = {
+    VITE_JAVA_API_BASE: env?.VITE_JAVA_API_BASE,
+    VITE_ML_API_BASE: env?.VITE_ML_API_BASE,
+    VITE_USE_PRODUCTION_API: env?.VITE_USE_PRODUCTION_API,
+  };
+  const raw = table[key];
+  return raw && raw.trim() ? raw.trim() : undefined;
+}
+
+const USE_PRODUCTION = readEnv("VITE_USE_PRODUCTION_API") === "true";
+
+const DEFAULT_JAVA_API_BASE = "http://localhost:8080";
+const DEFAULT_ML_API_BASE = "http://localhost:8000";
+
+/**
+ * Resolve a base URL.
+ *
+ * Without the production opt-in, a host that is not local is refused and
+ * replaced with the local default, and the reason is logged once. That way a
+ * stale `VITE_JAVA_API_BASE` pointing at a deployed service cannot silently
+ * take effect: you have to say you mean it.
+ */
+function resolveBase(
+  envKey: string,
+  localDefault: string,
+  label: string,
+): string {
+  const configured = readEnv(envKey);
+  if (!configured) return localDefault;
+
+  const isLocal =
+    /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/|$)/i.test(configured);
+
+  if (!isLocal && !USE_PRODUCTION) {
+    console.warn(
+      `[api] Ignoring ${envKey}: it points at a non-local host and ` +
+        `VITE_USE_PRODUCTION_API is not "true". Using ${localDefault} instead. ` +
+        `Set VITE_USE_PRODUCTION_API=true to allow the deployed service.`,
+    );
+    return localDefault;
+  }
+
+  if (!isLocal) {
+    console.warn(
+      `[api] ${label} is pointed at a DEPLOYED service (${configured}). ` +
+        `Any write, POST or DELETE from this session will affect it.`,
+    );
+  }
+  return normalizeBase(configured);
+}
+
+export const JAVA_API_BASE = resolveBase(
+  "VITE_JAVA_API_BASE",
+  DEFAULT_JAVA_API_BASE,
+  "Java backend",
+);
+
+export const ML_API_BASE = resolveBase(
+  "VITE_ML_API_BASE",
+  DEFAULT_ML_API_BASE,
+  "ML backend",
+);
+
+/** True when either base resolves to a non-local deployed host. */
+export const USING_PRODUCTION_API = USE_PRODUCTION;
+
 
 // ── Java backend endpoints ──────────────────────────────────────────
 

@@ -162,3 +162,22 @@
   box-sizing: border-box;
   margin: 0;
 }
+
+/* ── Accessibility utilities ─────────────────────────────────────
+   Visually hidden but exposed to assistive technology, for form
+   controls whose visible label is implied rather than printed.
+
+   A placeholder is NOT a substitute: it disappears on input and is
+   announced inconsistently, so a control labelled only by
+   `placeholder` has no reliable accessible name. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

@@ -1,6 +1,29 @@
 /* Weather Map + Radar views — Leaflet shell, layer pills, legend,
    location marker, tile-failure fallback. */
 
+/* ─── Stacking tiers ───────────────────────────────────────────
+   Two explicit bands, referenced by name so a new overlay cannot
+   accidentally land in the wrong one:
+
+     --map-ui-layer   FLOATING UI the user must always be able to read
+                      and click (pill bar, coordinate badge, reading tag,
+                      legend, zoom, probe, notices). These are plain HTML
+                      siblings of the map, so they sit above everything
+                      Leaflet draws.
+
+   Map DATA (pressure wash, isobars, wind streamlines) is NOT z-indexed
+   here — it lives inside Leaflet's pane tree in the `fieldPane` created at
+   map init. That matters: in Leaflet 1.9.4 `.leaflet-map-pane` is itself
+   `z-index: 400` with a transform, making it a stacking context, so the
+   whole basemap subtree paints at 400 no matter what the tile pane's own
+   200 says. Any overlay placed beside the map below 400 is simply hidden
+   underneath the tiles. Inside the pane tree, `fieldPane` (500) orders
+   correctly against overlayPane (400, temperature/rain fields) and
+   markerPane (600, the query dot). */
+:root {
+  --map-ui-layer: 700;
+}
+
 .map-view {
   position: relative;
   border: 1px solid var(--line);
@@ -17,6 +40,12 @@
   }
 }
 
+/* Layer-toggle pill bar.
+   This is FLOATING UI and must sit above every map-data overlay. It used to
+   be `position: static` with `z-index: auto`, so the absolutely-positioned
+   isobar (z-index 300) and streamline (z-index 320) overlays painted straight
+   over the pills. Giving it `position: relative` + a z-index in the UI tier
+   puts it back on top without changing the document flow. */
 .map-toolbar {
   display: flex;
   align-items: center;
@@ -27,6 +56,32 @@
   flex-wrap: nowrap;
   overflow-x: auto;
   scrollbar-width: thin;
+  position: relative;
+  z-index: var(--map-ui-layer);
+}
+
+/* P1-001, Option A — wrap rather than scroll.
+   The five pills plus the coordinate readout need 666px. `overflow-x: auto`
+   pushed "Wind" and "Radar" off-screen on a phone with no affordance showing
+   more content, so 40% of the layers were unreachable. The row wraps instead.
+
+   The breakpoint is 900px, not 560px: the pills alone need 487px, and the
+   coordinate readout needs the rest, so a 768px tablet was ALSO overflowing
+   (measured 666/658). Wrapping is the correct behaviour at every width where
+   the content genuinely does not fit. */
+@media (max-width: 900px) {
+  .map-toolbar {
+    flex-wrap: wrap;
+    overflow-x: visible;
+    row-gap: 8px;
+  }
+
+  /* Once the bar wraps, the coordinate readout takes its own full-width row
+     instead of competing with the pills for the last few pixels. */
+  .map-toolbar .map-meta {
+    margin-left: 0;
+    flex-basis: 100%;
+  }
 }
 
 .map-toolbar .map-eyebrow {
@@ -88,20 +143,42 @@
   color: var(--slate-teal);
 }
 
+/* The map canvas itself.
+   `overflow: hidden` is the containment guarantee: contour and streamline
+   paths are seeded across the whole grid and routinely extend past the map's
+   bounding box, so without clipping they painted up into the 45px pill
+   toolbar strip. `z-index: 0` additionally makes this element a stacking
+   context, so every overlay's z-index is resolved against the map rather
+   than the page — no descendant can escape into the header. */
 .map-surface {
   position: relative;
   width: 100%;
   height: calc(100% - 45px);
+  overflow: hidden;
+  z-index: 0;
+}
+
+/* Leaflet's map pane is `overflow: hidden`, but the overlays are pinned to the
+   viewport and re-traced on every pan/zoom, so the field pane needs its own
+   clip: a streamline seeded near the edge would otherwise paint into the
+   pill toolbar strip above.
+   Size is set in JS, not here: the pane's containing block is the map pane,
+   which is itself 0x0, so a percentage size resolves to zero and
+   `overflow: hidden` would clip the entire field away. */
+.leaflet-pane.leaflet-field-pane {
+  overflow: hidden;
 }
 
 /* Wind streamline field: above tiles, below the location dot and every
    floating panel. Pointer-transparent so map taps still select a location. */
 .wind-streamlines {
   position: absolute;
-  inset: 0;
-  z-index: 320;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
   pointer-events: none;
-  overflow: visible;
+  overflow: hidden;
 }
 
 .map-leaf {
@@ -177,19 +254,21 @@
    the map surface above the tiles but below the location dot and all
    floating panels, and is pointer-transparent so map taps still work. */
 
-/* Halo behind each coloured stroke: guarantees the line reads against
-   both light and dark basemap terrain without a per-line drop shadow. */
+/* Casing behind each coloured stroke: guarantees the line reads against
+   both light and dark basemap terrain without a per-line drop shadow.
+   Solid and continuous, but only ~1.7px wider than the core and well down in
+   opacity, so it supports the line instead of becoming the shape you see. */
 .wind-streamlines .wind-stream-halo {
   fill: none;
   stroke: var(--paper);
-  stroke-linecap: round;
+  stroke-linecap: butt;
   stroke-linejoin: round;
-  stroke-opacity: 0.5;
+  stroke-opacity: 0.55;
 }
 
 .wind-streamlines .wind-stream {
   fill: none;
-  stroke-linecap: round;
+  stroke-linecap: butt;
   stroke-linejoin: round;
   /* Dash-flow along the path is the only motion in the wind layer. */
   animation-name: wind-stream-flow;
@@ -198,9 +277,11 @@
   will-change: stroke-dashoffset;
 }
 
+/* One full dash period (26 + 16). Must match the `stroke-dasharray` on the
+   path, otherwise the animation jumps once per cycle. */
 @keyframes wind-stream-flow {
   to {
-    stroke-dashoffset: -26;
+    stroke-dashoffset: -42;
   }
 }
 
@@ -285,6 +366,38 @@
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
 }
 
+/* Per-layer honest note. Same tone and wording family as the full-view
+   message, but compact and scoped to the layer that actually failed. */
+/* Per-layer honest note. Same slot as the full-view banner — the two are
+   mutually exclusive (the note only renders when `gridFailed` is false), and
+   that slot was measured to neither clip nor collide with the zoom control at
+   either 390px or 1440px.
+
+   It used to sit at `top: 10px`, horizontally centred, with
+   `white-space: nowrap`. Measured on a 390px phone that produced a 362px note
+   inside a 356px map: clipped on BOTH edges by the container's
+   `overflow: hidden`, and overlapping the Leaflet zoom control. The message
+   that exists to be honest about missing data was unreadable at exactly the
+   moment it was needed. */
+.map-layer-note {
+  position: absolute;
+  bottom: 12px;
+  inset-inline: 12px;
+  z-index: 750;
+  padding: 8px 12px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-btn);
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  /* Wrap instead of nowrap, and never exceed the map's own width. */
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: center;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.14);
+}
+
 /* Tile failure: fall back to a plain dark surface with a subtle
    contour-line texture. Never an empty or half-loaded tile state.
    Hiding only the tile pane keeps the location dot and data layers
@@ -311,40 +424,189 @@
   color: var(--slate-teal);
 }
 
-/* Leaflet zoom controls — match app token set */
+/* Leaflet zoom controls, restyled for this app.
+
+   Verified rendered DOM (Leaflet 1.9.4, confirmed against the live page):
+
+     <div class="leaflet-control-zoom leaflet-bar leaflet-control">
+       <a class="leaflet-control-zoom-in" href="#" title="Zoom in" role="button"
+          aria-label="Zoom in" aria-disabled="false"><span aria-hidden="true">+</span></a>
+       <a class="leaflet-control-zoom-out" href="#" title="Zoom out" role="button"
+          aria-label="Zoom out" aria-disabled="false"><span aria-hidden="true">−</span></a>
+     </div>
+
+   Two things that earlier attempts missed:
+   1. Leaflet 1.9 wraps each glyph in `<span aria-hidden="true">`, so
+      `line-height` on the `<a>` no longer centres it. The glyph itself has to
+      be laid out on the span, which is why the rules below target
+      `.leaflet-control-zoom a span`.
+   2. Light mode resolves --paper to #FFFFFF and --ink to #16232B, which are
+      almost exactly Leaflet's own defaults, so a white-on-dark button reads
+      as "unstyled" even when the rule matches. The surface is therefore given
+      an explicit tinted fill and a real ring, which is visibly a different
+      thing from the stock control in both themes. */
 .map-surface .leaflet-control-zoom {
-  border: none;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  border: 1px solid var(--line);
   border-radius: var(--radius-btn);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12), 0 4px 14px rgba(0, 0, 0, 0.18);
   overflow: hidden;
 }
 
 .map-surface .leaflet-control-zoom a {
-  background: var(--paper);
-  color: var(--ink);
-  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  background: var(--slate-teal-tint);
+  color: var(--slate-teal);
   border-bottom: 1px solid var(--line);
-  width: 36px;
-  height: 36px;
-  line-height: 34px;
-  font-size: 18px;
-  font-weight: 700;
-  text-align: center;
+  text-decoration: none;
   transition: background var(--transition-fast), color var(--transition-fast);
 }
 
-.map-surface .leaflet-control-zoom a:hover {
-  background: var(--slate-teal-tint);
-  color: var(--slate-teal);
+/* The glyph lives in a span on Leaflet 1.9.4; size and centre it here. */
+.map-surface .leaflet-control-zoom a span {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 19px;
+  font-weight: 700;
+  line-height: 1;
+  color: inherit;
 }
 
+.map-surface .leaflet-control-zoom a:hover,
+.map-surface .leaflet-control-zoom a:focus-visible {
+  background: var(--paper);
+  color: var(--ink);
+}
+
+/* The divider is drawn on the container, so remove the per-link bottom
+   border and the inner-radius juggling it forced. */
 .map-surface .leaflet-control-zoom a:last-child {
   border-bottom: none;
-  border-radius: 0 0 var(--radius-btn) var(--radius-btn);
 }
 
-.map-surface .leaflet-control-zoom a:first-child {
-  border-radius: var(--radius-btn) var(--radius-btn) 0 0;
+/* ─── Synoptic pressure layer ───────────────────────────────────
+   Same field tier as the streamlines: above the basemap tiles, below every
+   floating control. `overflow: hidden` matches the container so a contour
+   cannot paint into the pill toolbar. */
+
+.pressure-wash {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  opacity: 0.3;
+}
+
+.pressure-field {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+/* Thin dark lines in light mode; the dark-theme tokens below lighten the
+   pair so they stay visible without turning into white-on-light.
+   Width/opacity are deliberately higher than a hairline: at 1.1px / 0.34 the
+   stroke resolved to a faint grey that disappeared entirely against the pale
+   basemap, which is why an earlier revision appeared to render nothing. */
+.pressure-field .isobar {
+  fill: none;
+  stroke: var(--ink);
+  stroke-width: 1.7;
+  stroke-opacity: 0.62;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.pressure-field .isobar-halo {
+  fill: none;
+  stroke: var(--paper);
+  stroke-width: 4;
+  stroke-opacity: 0.7;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.pressure-field .isobar-label-bg {
+  fill: var(--paper);
+  fill-opacity: 0.88;
+}
+
+.pressure-field .isobar-label {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  fill: var(--ink);
+}
+
+.pressure-field .pressure-system-ring {
+  fill: var(--paper);
+  fill-opacity: 0.9;
+  stroke-width: 1.6;
+}
+
+/* A low-pressure system is interesting, not automatically a hazard, so it
+   takes the orange accent rather than the reserved watch-red. */
+.pressure-field .pressure-system-ring.low {
+  stroke: var(--watch-orange);
+}
+
+.pressure-field .pressure-system-ring.high {
+  stroke: var(--slate-teal);
+}
+
+.pressure-field .pressure-system-label {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.pressure-field .pressure-system-label.low {
+  fill: var(--watch-orange-deep);
+}
+
+.pressure-field .pressure-system-label.high {
+  fill: var(--slate-teal);
+}
+
+/* Hover/tap readout. Follows the app's floating-badge pattern (paper
+   surface, line border, mono figures) rather than a dark chip.
+   Sits above the reading tag (800) as well as the toolbar and legend: the
+   probe follows the cursor and will regularly pass over the queried marker,
+   and at the UI tier alone the tag clipped its text. */
+.pressure-probe {
+  position: absolute;
+  z-index: calc(var(--map-ui-layer) + 150);
+  transform: translate(-50%, -170%);
+  padding: 5px 9px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.3;
+  color: var(--ink);
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.map-legend .legend-note {
+  margin-top: 7px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.35;
+  color: var(--muted);
 }
 
 /* ─── Radar page ──────────────────────────────────────────────── */

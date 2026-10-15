@@ -1,8 +1,9 @@
 import { CloudRain, Map as MapIcon, MapPin, Thermometer, Wind, Activity } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import 'leaflet/dist/leaflet.css';
 import './WeatherMap.css';
-import { reverseGeocodeLabel, useLocation } from '../location/LocationContext';
+import { reverseGeocode, useLocation } from '../location/LocationContext';
 import { WeatherField } from './weatherField';
 import {
   GridResult,
@@ -20,6 +21,11 @@ import {
   windStyle,
 } from './mapData';
 import { buildWindStreamlines, type Streamline } from './windStreamlines';
+import {
+  buildPressureLayer,
+  pressureWashColor,
+  type PressureLayer,
+} from './pressureLayer';
 
 const QUERY_RINGS_KM = [25, 50, 75];
 
@@ -52,6 +58,24 @@ interface LegendSpec {
   to: string;
 }
 
+/**
+ * Per-dimension data availability.
+ *
+ * Temperature, Rain, Wind and pressure all arrive in ONE grid, so a failed
+ * fetch genuinely means everything failed and the full-view message is the
+ * honest thing to show. But an individual dimension can still be absent from
+ * a grid that otherwise loaded (e.g. the source omitted pressure), and that
+ * must not be reported as a total outage. `gridFailed` is the total case;
+ * the rest are scoped notes against just the layer that lost its data.
+ */
+interface LayerAvailability {
+  gridFailed: boolean;
+  temperature: boolean;
+  precipitation: boolean;
+  wind: boolean;
+  pressure: boolean;
+}
+
 function legendFor(layer: LayerId, grid: GridResult | null): LegendSpec | null {
   if (layer === 'standard' || layer === 'radar' || !grid) return null;
   if (layer === 'temperature') {
@@ -81,6 +105,54 @@ function legendFor(layer: LayerId, grid: GridResult | null): LegendSpec | null {
     from: `${Math.round(grid.minWind)} km/h`,
     to: `${Math.round(grid.maxWind)} km/h`,
   };
+}
+
+/** The Wind layer shows two dimensions, so its legend carries both. */
+function windPressureNote(grid: GridResult | null): string | null {
+  if (!grid || grid.minPressure == null || grid.maxPressure == null) return null;
+  return `Pressure ${Math.round(grid.minPressure)}–${Math.round(grid.maxPressure)} hPa · isobars every 4 hPa`;
+}
+
+/**
+ * The honest note for the CURRENT view, scoped to what actually failed.
+ * Returns null when everything the view needs loaded fine, so a healthy
+ * layer never carries a warning it doesn't deserve.
+ */
+function partialNote(layer: LayerId, a: LayerAvailability): string | null {
+  const missing: string[] = [];
+  if (layer === 'standard' || layer === 'temperature') {
+    if (!a.temperature) missing.push('Temperature');
+  }
+  if (layer === 'standard' || layer === 'precipitation') {
+    if (!a.precipitation) missing.push('Rain');
+  }
+  if (layer === 'standard' || layer === 'wind') {
+    if (!a.wind) missing.push('Wind');
+    else if (!a.pressure) missing.push('Pressure (isobars)');
+  }
+  if (missing.length === 0) return null;
+  if (missing.length === 1) return `${missing[0]} data unavailable right now.`;
+  return `${missing.join(' and ')} data unavailable right now.`;
+}
+
+/** Nearest real observation to a lat/lon — the probe never invents a value. */
+function nearestPoint(grid: GridResult, lat: number, lon: number) {
+  let best: (typeof grid.points)[number] | null = null;
+  let bestD = Infinity;
+  for (const p of grid.points) {
+    const d = Math.hypot(p.lat - lat, p.lon - lon);
+    if (d < bestD) {
+      bestD = d;
+      best = p;
+    }
+  }
+  return best;
+}
+
+/** Small arrow glyph for a bearing in degrees. */
+function arrowGlyph(bearing: number): string {
+  const arrows = ['↑', '↗', '→', '↘', '↓', '↙', '←', '↖'];
+  return arrows[Math.round((((bearing % 360) + 360) % 360) / 45) % 8];
 }
 
 /** "HH:MM" clock in Asia/Kolkata for the empty-state "Updated" label. */
@@ -137,15 +209,40 @@ export default function WeatherMapView() {
   const [point, setPoint] = useState<PointWeather | null>(null);
   const [tilesFailed, setTilesFailed] = useState(false);
   const [layerLoading, setLayerLoading] = useState(false);
-  const [layerError, setLayerError] = useState(false);
+  const [avail, setAvail] = useState<LayerAvailability>({
+    gridFailed: false,
+    temperature: false,
+    precipitation: false,
+    wind: false,
+    pressure: false,
+  });
   const [readingPos, setReadingPos] = useState<{ x: number; y: number } | null>(null);
   // Wind streamlines: traced paths through the wind vector field, re-seeded on
   // pan/zoom so coverage stays reasonable at any zoom level.
   const [streamlines, setStreamlines] = useState<Streamline[]>([]);
+  // Synoptic pressure field: isobars, L/H systems and the background wash.
+  const [pressure, setPressure] = useState<PressureLayer | null>(null);
+  // Hover/tap readout for the pressure field (null = not over the map).
+  const [probe, setProbe] = useState<{ x: number; y: number; text: string } | null>(null);
   // Container pixel size the streamline paths were traced against; the SVG
   // viewBox is re-synced on pan/zoom/resize so paths stay aligned.
   const [mapW, setMapW] = useState(0);
   const [mapH, setMapH] = useState(0);
+  /**
+   * Leaflet pane that hosts the map-DATA overlays (pressure wash, isobars,
+   * wind streamlines).
+   *
+   * These have to live inside Leaflet's pane tree, not beside it. In Leaflet
+   * 1.9.4 `.leaflet-map-pane` itself carries `z-index: 400` and a transform, so
+   * it is a stacking context: the entire basemap subtree — tiles included —
+   * paints at the 400 tier regardless of the tile pane's own 200. An overlay
+   * parked next to it at 300/320 therefore renders UNDERNEATH the tiles and is
+   * invisible. A pane at 500 sits above overlayPane (400, the temperature/rain
+   * field canvases) and below markerPane (600, the query dot), which is the
+   * order the layer spec calls for.
+   */
+  const [fieldPane, setFieldPane] = useState<HTMLElement | null>(null);
+  const fieldPaneRef = useRef<HTMLElement | null>(null);
   // Latest grid + active layer, read by the pan/zoom re-seed handler without
   // re-subscribing the map listener on every layer change.
   const gridRef = useRef<GridResult | null>(null);
@@ -175,6 +272,7 @@ export default function WeatherMapView() {
     const wantWind = activeLayer === 'standard' || activeLayer === 'wind';
     if (!wantWind) {
       setStreamlines([]);
+      setPressure(null);
       setMapW(0);
       setMapH(0);
       return;
@@ -182,23 +280,70 @@ export default function WeatherMapView() {
     const size = map.getSize();
     if (!size || size.x <= 0 || size.y <= 0) {
       setStreamlines([]);
+      setPressure(null);
       setMapW(0);
       setMapH(0);
       return;
     }
-    const lines = buildWindStreamlines(
-      grid.points,
-      (x, y) => {
-        const ll = map.containerPointToLatLng([x, y]);
-        return [ll.lat, ll.lng] as [number, number];
-      },
-      [0, 0, size.x, size.y],
-      grid.maxWind,
-      windColor,
-      windStyle,
-      activeLayer === 'standard',
+    const project = (la: number, lo: number): [number, number] => {
+      const pt = map.latLngToContainerPoint([la, lo]);
+      return [pt.x, pt.y];
+    };
+    const unproject = (x: number, y: number): [number, number] => {
+      const ll = map.containerPointToLatLng([x, y]);
+      return [ll.lat, ll.lng];
+    };
+
+    // The overlay pane is a child of Leaflet's map pane, which Leaflet
+    // translates to follow the pan/zoom. The overlays are drawn in CONTAINER
+    // pixel space, so the pane has to be shifted back by that same offset or
+    // every path lands thousands of pixels away.
+    //
+    // Two Leaflet 1.9.4 details are load-bearing here:
+    //  - `getPane()` with no argument returns undefined; it indexes `_panes` by
+    //    the string it is given, so the map pane must be requested by name.
+    //  - The offset comes from the map pane's computed transform, NOT from
+    //    `getPixelOrigin()`, which returns projected WORLD coordinates (values
+    //    in the tens of thousands) rather than the on-screen offset.
+    const pane = fieldPaneRef.current;
+    const mapPane: HTMLElement | undefined = map.getPane?.('mapPane');
+    if (pane && mapPane) {
+      const t = getComputedStyle(mapPane).transform;
+      // `none` means the map is at its identity position; nothing to cancel.
+      const m = t && t !== 'none' ? new DOMMatrixReadOnly(t) : null;
+      const dx = m ? m.m41 : 0;
+      const dy = m ? m.m42 : 0;
+      // The pane's containing block is the map pane, which is itself 0x0, so a
+      // percentage size would resolve to zero and `overflow: hidden` would clip
+      // the whole field away. The pane is therefore sized in real pixels from
+      // the map container and offset by the inverse of the map pane's shift.
+      pane.style.width = `${size.x}px`;
+      pane.style.height = `${size.y}px`;
+      pane.style.transform = `translate3d(${-dx}px, ${-dy}px, 0)`;
+    }
+
+    setStreamlines(
+      buildWindStreamlines(
+        grid.points,
+        unproject,
+        project,
+        [0, 0, size.x, size.y],
+        grid.minWind,
+        grid.maxWind,
+        windColor,
+        windStyle,
+        activeLayer === 'standard',
+      ),
     );
-    setStreamlines(lines);
+
+    // Pressure layer: derived from the same real grid. If the source gave no
+    // pressure the renderer returns empty isobars, and the wind layer simply
+    // continues without them — a missing MSLP field never takes down wind.
+    const lats = [...new Set(grid.points.map((p) => p.lat))].sort((a, b) => b - a);
+    const lons = [...new Set(grid.points.map((p) => p.lon))].sort((a, b) => a - b);
+    setPressure(
+      buildPressureLayer(grid.points, project, lats, lons, activeLayer === 'standard'),
+    );
     setMapW(size.x);
     setMapH(size.y);
   };
@@ -231,6 +376,20 @@ export default function WeatherMapView() {
       });
       tiles.addTo(map);
       mapRef.current = map;
+
+      // Pane for the map-data overlays — see the fieldPane declaration for why
+      // this has to be a real Leaflet pane. 500 places it above the
+      // temperature/rain field canvases (overlayPane 400) and below the query
+      // marker (markerPane 600).
+      // Named 'field', not 'fieldPane': Leaflet builds the class as
+      // `leaflet-<name>-pane`, so this yields `leaflet-field-pane`, which is
+      // what the stylesheet targets.
+      const pane = map.createPane('field');
+      pane.style.zIndex = '500';
+      pane.style.pointerEvents = 'none';
+      fieldPaneRef.current = pane;
+      setFieldPane(pane);
+
       setReady(true);
 
       // Tapping the map selects the canonical location: the query dot, rings
@@ -239,17 +398,42 @@ export default function WeatherMapView() {
       map.on('click', (e: any) => {
         const lat = e.latlng.lat as number;
         const lon = e.latlng.lng as number;
-        void reverseGeocodeLabel(lat, lon).then((name) => {
+        // Resolve the administrative pieces, not just a display label: the
+        // district drives India-only warning bulletins, and the country gates
+        // whether IMD applies at all.
+        void reverseGeocode(lat, lon).then(({ name, district, state, country }) => {
           // A tap is always a real selection — including the very first one
           // (location === null → this tap becomes the only source). Only a
           // re-tap on the exact current coordinates is a no-op.
           setLocation((prev) =>
             prev && prev.latitude === lat && prev.longitude === lon
               ? {}
-              : { latitude: lat, longitude: lon, name, source: 'map' },
+              : { latitude: lat, longitude: lon, name, district, region: state, country, source: 'map' },
           );
         });
       });
+
+      // Hover / tap readout for the synoptic layer. Reads the same real grid
+      // the field is drawn from; never interpolated beyond what was observed.
+      const probeAt = (e: any) => {
+        const g = gridRef.current;
+        if (!g) return;
+        const p = nearestPoint(g, e.latlng.lat, e.latlng.lng);
+        if (!p || !Number.isFinite(p.pressure)) {
+          setProbe(null);
+          return;
+        }
+        const pt = map.latLngToContainerPoint(e.latlng);
+        // Arrow shows where the wind is going (bearing + 180).
+        const towards = (p.windDir + 180) % 360;
+        setProbe({
+          x: pt.x,
+          y: pt.y,
+          text: `${Math.round(p.pressure)} hPa · ${Math.round(p.windSpeed)} km/h ${arrowGlyph(towards)} ${compass(towards)}`,
+        });
+      };
+      map.on('mousemove', probeAt);
+      map.on('mouseout', () => setProbe(null));
 
       // Self-heal sizing races: if the container had zero size when
       // Leaflet initialised (e.g. mid-layout mount), refit it now and on
@@ -356,7 +540,9 @@ export default function WeatherMapView() {
       setPoint(null);
       setReadingPos(null);
       setGrid(null);
-      setLayerError(false);
+      setStreamlines([]);
+      setPressure(null);
+      setAvail({ gridFailed: false, temperature: false, precipitation: false, wind: false, pressure: false });
       setLayerLoading(false);
       map.setView(NEUTRAL_MAP_VIEWPORT as [number, number], NEUTRAL_MAP_ZOOM);
       return;
@@ -364,13 +550,27 @@ export default function WeatherMapView() {
     if (dotRef.current) {
       dotRef.current.setLatLng([location.latitude, location.longitude]);
     } else {
+      // The dot marks where the numbers on screen came from. It is not a
+      // control: `interactive: false` already means tapping it does nothing.
+      //
+      // Leaflet nonetheless gave it role="button" and tabindex="0", so a
+      // keyboard or screen-reader user tabbed onto a 12x12 element that
+      // announced as the bare word "button" and did nothing when activated. A
+      // control with no action must not advertise itself as one.
+      //
+      // `keyboard: false` removes the role and the tab stop. `alt` and `title`
+      // still name it, so anyone who reaches the element another way learns
+      // which place it marks instead of getting nothing.
       dotRef.current = L.marker([location.latitude, location.longitude], {
         icon: L.divIcon({
-          className: '',
+          className: 'map-loc-dot-marker',
           html: '<div class="map-loc-dot"></div>',
           iconSize: [12, 12],
           iconAnchor: [6, 6],
         }),
+        alt: `Weather location: ${location.name || 'selected point'}`,
+        title: location.name || 'Selected point',
+        keyboard: false,
         interactive: false,
         zIndexOffset: 900,
       }).addTo(map);
@@ -404,7 +604,6 @@ export default function WeatherMapView() {
 
     let cancelled = false;
     setLayerLoading(true);
-    setLayerError(false);
 
     (async () => {
       try {
@@ -413,6 +612,18 @@ export default function WeatherMapView() {
         setGrid(g);
         setGridAt(Date.now());
         gridRef.current = g;
+
+        // Per-dimension availability from the grid that DID load. A dimension
+        // with no real observation is reported against itself only; the other
+        // layers keep rendering normally.
+        const anyPressure = g.points.some((p) => Number.isFinite(p.pressure));
+        setAvail({
+          gridFailed: false,
+          temperature: g.points.some((p) => Number.isFinite(p.temp)),
+          precipitation: g.points.some((p) => Number.isFinite(p.precip)),
+          wind: g.points.some((p) => Number.isFinite(p.windSpeed)),
+          pressure: anyPressure,
+        });
 
         const rings = { lat: location.latitude, lon: location.longitude, radiiKm: QUERY_RINGS_KM };
 
@@ -450,20 +661,27 @@ export default function WeatherMapView() {
         });
         precipFieldRef.current.setOpacity(precipOpacity);
 
-        // Wind arrows layer
-        if (windLayerRef.current) {
-          windLayerRef.current.clearLayers();
-          map.removeLayer(windLayerRef.current);
-        }
-        const windVisible = isOverview || isWindFocus;
+        // Wind field: streamlines + synoptic pressure. Isolated in its own
+        // try/catch so a fault in the isobar/streamline renderer can never
+        // propagate up and blank the temperature and rain layers with it.
         if (windLayerRef.current) {
           map.removeLayer(windLayerRef.current);
           windLayerRef.current = null;
         }
+        const windVisible = isOverview || isWindFocus;
         if (windVisible) {
-          reseedStreamlines(map, g, layer);
+          try {
+            reseedStreamlines(map, g, layer);
+            setAvail((a) => ({ ...a, wind: true, pressure: anyPressure }));
+          } catch (e) {
+            console.warn('[WeatherMap] wind/pressure layer failed, other layers kept:', e);
+            setStreamlines([]);
+            setPressure(null);
+            setAvail((a) => ({ ...a, wind: false, pressure: false }));
+          }
         } else {
           setStreamlines([]);
+          setPressure(null);
           setMapW(0);
           setMapH(0);
         }
@@ -483,11 +701,41 @@ export default function WeatherMapView() {
             opacity: 0.8,
           }).addTo(map);
         }
-
-      } catch {
+      } catch (err) {
+        // Distinguish the two failure kinds. A rejected/unavailable GRID is a
+        // genuine total outage and the honest response is the full-view
+        // message. Anything else is a per-layer rendering fault: keep the
+        // layers that already drew, and say which one could not, rather than
+        // reporting a partial failure as a total one.
+        console.warn('[WeatherMap] layer effect failed:', err);
         if (!cancelled) {
-          setGrid(null);
-          setLayerError(true);
+          const gridBroken = !gridRef.current;
+          if (gridBroken) {
+            setGrid(null);
+            setStreamlines([]);
+            setPressure(null);
+            setAvail({ gridFailed: true, temperature: false, precipitation: false, wind: false, pressure: false });
+          } else {
+            // Grid is fine: narrow the failure to the layer we were drawing.
+            const partial: LayerAvailability = {
+              gridFailed: false,
+              temperature: true,
+              precipitation: true,
+              wind: true,
+              pressure: true,
+            };
+            if (layer === 'standard' || layer === 'temperature') partial.temperature = false;
+            if (layer === 'standard' || layer === 'precipitation') partial.precipitation = false;
+            if (layer === 'standard' || layer === 'wind') {
+              partial.wind = false;
+              partial.pressure = false;
+            }
+            setAvail(partial);
+            if (!partial.wind) {
+              setStreamlines([]);
+              setPressure(null);
+            }
+          }
         }
       } finally {
         if (!cancelled) setLayerLoading(false);
@@ -506,8 +754,111 @@ export default function WeatherMapView() {
       `${Math.abs(location.longitude).toFixed(4)}° ${location.longitude >= 0 ? 'E' : 'W'}`
     : 'No location selected';
 
+  /**
+   * The map-data overlays, portalled into Leaflet's `fieldPane`.
+   * Painted back-to-front: pressure wash (background field), isobars with
+   * their hPa labels and L/H systems, then the animated wind streamlines.
+   */
+  const fieldOverlays = (
+    <>
+      {/* Soft pressure-gradient wash: a background field, never competing
+          with the basemap, the isobars or the streamlines. */}
+      {pressure && pressure.min != null && pressure.max != null && pressure.max > pressure.min && (
+        <div
+          className="pressure-wash"
+          style={{
+            background: `linear-gradient(160deg, ${pressureWashColor(1)} 0%, ${pressureWashColor(
+              0.55,
+            )} 45%, ${pressureWashColor(0)} 100%)`,
+          }}
+        />
+      )}
+      {pressure && pressure.isobars.length > 0 && (
+        <svg
+          className="pressure-field"
+          viewBox={`0 0 ${mapW || 1} ${mapH || 1}`}
+          preserveAspectRatio="none"
+          aria-hidden
+        >
+          {/* Isobars with hPa labels along the line. */}
+          {pressure.isobars.map((b, i) => (
+            <g key={`b${i}`}>
+              <path d={b.d} className="isobar-halo" />
+              <path d={b.d} className="isobar" />
+              {b.labelAt.map(([lx, ly], k) => (
+                <g key={k}>
+                  <rect x={lx - 17} y={ly - 8} width={34} height={16} rx={3} className="isobar-label-bg" />
+                  <text x={lx} y={ly + 4} className="isobar-label" textAnchor="middle">
+                    {b.value}
+                  </text>
+                </g>
+              ))}
+            </g>
+          ))}
+          {/* L / H systems: only where the data shows a real interior
+              extremum. Orange/teal, never the reserved watch-red. */}
+          {pressure.systems.map((s, i) => {
+            const c = s.kind === 'L' ? 'low' : 'high';
+            const ll = mapRef.current?.latLngToContainerPoint([s.lat, s.lon]);
+            if (!ll) return null;
+            return (
+              <g key={`s${i}`} className={`pressure-system ${c}`}>
+                <circle cx={ll.x} cy={ll.y} r={11} className={`pressure-system-ring ${c}`} />
+                <text x={ll.x} y={ll.y + 5} className={`pressure-system-label ${c}`} textAnchor="middle">
+                  {s.kind}
+                </text>
+                <title>{`${s.kind === 'L' ? 'Low' : 'High'} pressure ${Math.round(s.value)} hPa`}</title>
+              </g>
+            );
+          })}
+        </svg>
+      )}
+      {streamlines.length > 0 && (
+        <svg
+          className="wind-streamlines"
+          viewBox={`0 0 ${mapW || 1} ${mapH || 1}`}
+          preserveAspectRatio="none"
+          aria-hidden
+        >
+          {streamlines.map((s, i) => (
+            <g key={i}>
+              {/* Casing behind the coloured stroke so the line reads against
+                  both light and dark basemap terrain. Kept deliberately tight
+                  to the core: at the old +3.4px on a 5px stroke the halo was
+                  the dominant shape and the line read as a thick band. */}
+              <path d={s.d} className="wind-stream-halo" strokeWidth={s.width + 1.7} />
+              <path
+                d={s.d}
+                className="wind-stream"
+                stroke={s.color}
+                strokeWidth={s.width}
+                strokeOpacity={s.opacity}
+                /* A travelling dash, not a string of dots. Round caps on a
+                   short dash at the old 5px weight rendered as a chain of
+                   blobs; with a thin core, a longer dash and butt caps this
+                   reads as motion along a line. The period must match the
+                   wind-stream-flow keyframe below or the loop will visibly
+                   jump. */
+                strokeDasharray="26 16"
+                style={{
+                  strokeDashoffset: s.dashOffset,
+                  animationDuration: `${s.dashDuration}s`,
+                }}
+              />
+            </g>
+          ))}
+        </svg>
+      )}
+    </>
+  );
+
   return (
     <div className={`map-view ${tilesFailed ? 'tiles-failed' : ''}`}>
+      {/* The map view had no heading at all, so it was the one page with
+          neither an h1 nor an h2 for assistive tech to navigate by. Visually
+          hidden: the layer pills are the visible interface and adding a
+          visible title would displace them. */}
+      <h1 className="sr-only">Weather map</h1>
       <div className="map-toolbar">
         {LAYERS.map(({ id, label, Icon }) => (
           <button
@@ -551,6 +902,12 @@ export default function WeatherMapView() {
       )}
       <div className="map-surface">
         <div ref={mountRef} className="map-leaf" />
+        {/* Map-DATA overlays live in Leaflet's `fieldPane` (see fieldPane),
+            not here: `.leaflet-map-pane` is itself a z-index:400 stacking
+            context, so an overlay parked beside it renders underneath the
+            basemap. Portalled in so Leaflet's pane ordering governs them.
+            Order inside the pane is DOM order: wash, isobars, streamlines. */}
+        {fieldPane && createPortal(fieldOverlays, fieldPane)}
         {!location && (
           <div className="weather-empty">
             <MapPin aria-hidden />
@@ -562,45 +919,26 @@ export default function WeatherMapView() {
             </div>
           </div>
         )}
-        {streamlines.length > 0 && (
-          <svg
-            className="wind-streamlines"
-            viewBox={`0 0 ${mapW || 1} ${mapH || 1}`}
-            preserveAspectRatio="none"
-            aria-hidden
-          >
-            {streamlines.map((s, i) => (
-              <g key={i}>
-                {/* Halo behind the coloured stroke so the line reads against
-                    both light and dark basemap terrain. */}
-                <path
-                  d={s.d}
-                  className="wind-stream-halo"
-                  strokeWidth={s.width + 2.6}
-                />
-                <path
-                  d={s.d}
-                  className="wind-stream"
-                  stroke={s.color}
-                  strokeWidth={s.width}
-                  strokeOpacity={s.opacity}
-                  strokeDasharray="10 16"
-                  style={{
-                    strokeDashoffset: s.dashOffset,
-                    animationDuration: `${s.dashDuration}s`,
-                  }}
-                />
-              </g>
-            ))}
-          </svg>
-        )}
-        {layerLoading && <div className="map-loading">Loading {activeLabel.toLowerCase()} layer…</div>}
-        {layerError && (
-          <div className="map-layer-error">
-            Live {activeLabel.toLowerCase()} data is unavailable right now. Showing the base map with your location reading.
+        {probe && (
+          <div className="pressure-probe" style={{ left: probe.x, top: probe.y }}>
+            {probe.text}
           </div>
         )}
-        {layer === 'precipitation' && grid && grid.maxRain <= MEANINGFUL_RAIN && !layerLoading && !layerError && (
+        {layerLoading && <div className="map-loading">Loading {activeLabel.toLowerCase()} layer…</div>}
+        {/* Full-view message ONLY when the whole grid failed — the one case
+            where a blank map is the accurate thing to show. */}
+        {avail.gridFailed && (
+          <div className="map-layer-error">
+            Live {activeLabel.toLowerCase()} data is unavailable right now. Showing the base map
+            with your location reading.
+          </div>
+        )}
+        {/* Per-layer honest notes: scoped to the layer that actually lost its
+            data, so a partial failure is never reported as a total one. */}
+        {!avail.gridFailed && partialNote(layer, avail) && (
+          <div className="map-layer-note">{partialNote(layer, avail)}</div>
+        )}
+        {layer === 'precipitation' && grid && grid.maxRain <= MEANINGFUL_RAIN && !layerLoading && !avail.gridFailed && (
           <div className="weather-empty">
             <CloudRain aria-hidden />
             <div className="weather-empty-title">No precipitation detected</div>
@@ -618,6 +956,9 @@ export default function WeatherMapView() {
               <span>{legend.from}</span>
               <span>{legend.to}</span>
             </div>
+            {layer === 'wind' && windPressureNote(grid) && (
+              <div className="legend-note">{windPressureNote(grid)}</div>
+            )}
           </div>
         )}
         {reading && readingPos && (

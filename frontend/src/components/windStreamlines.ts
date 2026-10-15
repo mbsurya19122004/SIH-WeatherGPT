@@ -6,9 +6,9 @@
  *  - Streamlines must FOLLOW the real wind vector at each point. Each step
  *    direction comes from bilinear interpolation of the surrounding real grid
  *    observations — never a faked/decorative direction.
- *  - Sparsity is respected: the observation grid is 5x5, so sampling is clamped
- *    half a cell inside the data box and streamlines stop at the edge rather
- *    than extrapolating into invented detail.
+ *  - Sparsity is respected: the observation grid is 5x5, which at map zoom is
+ *    only about a third of the viewport. Streamlines are seeded AND terminated
+ *    inside the data box; see `dataBoxPx` for why that matters.
  *  - Legibility: each line carries a halo (--paper) stroke behind the coloured
  *    stroke so it reads against both light and dark terrain, plus an opacity
  *    floor so calm-wind streamlines never fade to invisible.
@@ -34,13 +34,77 @@ export interface Streamline {
   dashDuration: number;
 }
 
-/** Minimum opacity so calm wind still reads against the basemap. */
-const MIN_OPACITY = 0.34;
+/**
+ * Minimum opacity so calm wind still reads against the basemap.
+ * A thin, low-contrast teal line over a pale OSM basemap is effectively
+ * invisible, so the floor sits well above "barely there".
+ */
+const MIN_OPACITY = 0.55;
 /** Clamp on step length in pixels so a fast cell can't make a huge jump. */
-const MAX_STEP_PX = 13;
+const MAX_STEP_PX = 9;
+/**
+ * Hard limit on how far the heading may change between two consecutive steps.
+ *
+ * A real wind field turns gradually; a streamline that folds back on itself
+ * within one step is always an artefact of a bad sample or a bad
+ * interpolation, never of the atmosphere. Clamping the turn keeps a single
+ * wrong cell from producing a visually broken hairpin no matter what the
+ * underlying cause was.
+ */
+const MAX_TURN_DEG = 22;
 /** Steps traced forward from each seed. */
-const FOCUS_STEPS = 30;
-const OVERVIEW_STEPS = 22;
+const FOCUS_STEPS = 40;
+const OVERVIEW_STEPS = 30;
+/**
+ * Reject a traced line whose midpoint lands too close to an already-accepted
+ * one. Streamline seeding naturally produces near-duplicate parallel paths,
+ * which bunch into a comb; spacing the survivors keeps the field even without
+ * inventing coverage the sparse grid can't support.
+ *
+ * The threshold is a fraction of the DATA BOX rather than a fixed pixel count,
+ * because the box scales with zoom: a fixed 46px is a hair's breadth on a
+ * zoomed-out map and most of the available field when zoomed in.
+ */
+const SEPARATION_FRACTION = 0.085;
+const MIN_SEPARATION_PX = 18;
+const MAX_SEPARATION_PX = 46;
+
+const DEG = Math.PI / 180;
+
+/** Wrap an angle difference into (-180, 180]. */
+function wrap180(d: number): number {
+  let x = d % 360;
+  if (x > 180) x -= 360;
+  if (x <= -180) x += 360;
+  return x;
+}
+
+/**
+ * Wind direction is a CIRCULAR quantity, and interpolating the raw degree
+ * values is simply wrong.
+ *
+ * A live 5x5 sample of the same synoptic flow routinely straddles the wrap:
+ *
+ *     8    3  355  339  316
+ *   360  343  343  337  344
+ *
+ * Those are all one coherent NNW flow, but a linear average of 3 and 360
+ * yields 181.5 — the exact opposite direction. Cells on either side of the
+ * wrap therefore reported reversed vectors, which is what produced both the
+ * hairpin/switchback turns and the unnaturally straight parallel runs: where
+ * the raw degrees happened to be numerically close the interpolated heading
+ * barely moved, and where they were not, it flipped.
+ *
+ * The fix is to interpolate the unit VECTOR and recover the angle afterwards.
+ * sin/cos are continuous across the wrap, so the resulting field is correct
+ * with no special-casing at all.
+ *
+ * Components are returned in screen convention: +x east, +y south, pointing
+ * the way the wind BLOWS TOWARD (the meteorological direction is where it
+ * comes FROM, so the FROM vector is negated here).
+ */
+const towardEast = (p: GridPoint) => -Math.sin(p.windDir * DEG);
+const towardSouth = (p: GridPoint) => Math.cos(p.windDir * DEG);
 
 /** Build the 5x5 observation lattice (row 0 = northernmost). */
 function buildLattice(points: GridPoint[]): {
@@ -61,7 +125,7 @@ function buildLattice(points: GridPoint[]): {
     lons.map((lo) => {
       const hit = points.find((p) => p.lat === la && p.lon === lo);
       return (
-        hit ?? { lat: la, lon: lo, temp: 0, precip: 0, windSpeed: 0, windDir: 0, gust: 0 }
+        hit ?? { lat: la, lon: lo, temp: 0, precip: 0, windSpeed: 0, windDir: 0, gust: 0, pressure: NaN }
       );
     }),
   );
@@ -99,8 +163,11 @@ function bilinear(grid: GridPoint[][], gi: number, gj: number, valueOf: (p: Grid
  *
  * @param points      real wind observations (the 5x5 grid)
  * @param unproject   (x, y) -> [lat, lon] (Leaflet containerPointToLatLng)
+ * @param project     (lat, lon) -> [x, y] (Leaflet latLngToContainerPoint)
  * @param boundsPx    [minX, minY, maxX, maxY] visible viewport
- * @param maxWind     grid max wind, normalises speed -> colour/width
+ * @param minWind     grid min wind; width/colour normalise across the
+ *                     OBSERVED range, not from zero (see `norm` below)
+ * @param maxWind     grid max wind
  * @param windColorFn shared wind colour scale (slate-teal -> brass)
  * @param windStyleFn shared wind style helper
  * @param overview    true for the softer combined-overview treatment
@@ -108,7 +175,9 @@ function bilinear(grid: GridPoint[][], gi: number, gj: number, valueOf: (p: Grid
 export function buildWindStreamlines(
   points: GridPoint[],
   unproject: (x: number, y: number) => [number, number],
+  project: (lat: number, lon: number) => [number, number],
   boundsPx: [number, number, number, number],
+  minWind: number,
   maxWind: number,
   windColorFn: (norm: number) => string,
   windStyleFn: (speed: number, maxSpeed: number) => { color: string; opacity: number; size: number },
@@ -126,13 +195,48 @@ export function buildWindStreamlines(
   const h = maxY - minY;
   if (!(w > 0) || !(h > 0)) return [];
 
-  // Seed count scales with viewport area so density stays reasonable across
-  // zoom levels without becoming a tangle when zoomed out.
-  const area = w * h;
-  const density = overview ? 1 / 30000 : 1 / 15000;
+  /**
+   * The pixel extent of the OBSERVATIONS, not of the viewport.
+   *
+   * This distinction is the whole ballgame. At map zoom the 5x5 grid spans
+   * roughly a third of the visible width, so two thirds of the map has no
+   * measurements at all. `bilinear` clamps out-of-box lookups to the boundary
+   * cell, so a line that kept going out there would be drawn from a constant,
+   * invented direction — which is what produced the ruler-straight lines
+   * spanning the entire map. Traces are therefore confined to the data box and
+   * simply stop at its edge, so the map shows wind only where wind was
+   * actually measured.
+   */
+  const corners: Array<[number, number]> = [
+    project(lats[0], lons[0]),
+    project(lats[0], lons[lons.length - 1]),
+    project(lats[lats.length - 1], lons[0]),
+    project(lats[lats.length - 1], lons[lons.length - 1]),
+  ];
+  const boxL = Math.min(...corners.map((c) => c[0]));
+  const boxR = Math.max(...corners.map((c) => c[0]));
+  const boxT = Math.min(...corners.map((c) => c[1]));
+  const boxB = Math.max(...corners.map((c) => c[1]));
+  // Nothing to draw if the data box is off-screen or degenerate.
+  if (boxR - boxL < 40 || boxB - boxT < 40) return [];
+  // Intersect with the viewport; traces are clipped to whichever is tighter.
+  const dataBoxPx: [number, number, number, number] = [
+    Math.max(boxL, minX),
+    Math.max(boxT, minY),
+    Math.min(boxR, maxX),
+    Math.min(boxB, maxY),
+  ];
+  const boxW = dataBoxPx[2] - dataBoxPx[0];
+  const boxH = dataBoxPx[3] - dataBoxPx[1];
+  if (!(boxW > 0) || !(boxH > 0)) return [];
+
+  // Seed count scales with the AREA THAT HAS DATA so density stays reasonable
+  // across zoom levels without becoming a tangle when zoomed out.
+  const area = boxW * boxH;
+  const density = overview ? 1 / 4200 : 1 / 2100;
   const seedCount = Math.max(
-    overview ? 16 : 32,
-    Math.min(overview ? 34 : 80, Math.round(area * density)),
+    overview ? 26 : 48,
+    Math.min(overview ? 54 : 110, Math.round(area * density)),
   );
 
   // Deterministic low-discrepancy (golden-ratio spiral) seeds rather than
@@ -140,17 +244,23 @@ export function buildWindStreamlines(
   const GOLDEN = 0.6180339887498949;
   const steps = overview ? OVERVIEW_STEPS : FOCUS_STEPS;
   const out: Streamline[] = [];
+  // Midpoints of accepted lines, for the near-duplicate rejection below.
+  const kept: Array<[number, number]> = [];
 
   for (let k = 0; k < seedCount; k++) {
     const u = (k * GOLDEN) % 1;
     const v = ((k + 1) * GOLDEN) % 1;
-    // Inset from the very edge so seeds aren't immediately clipped away.
-    let x = minX + w * (0.06 + 0.88 * u);
-    let y = minY + h * (0.06 + 0.88 * v);
+    // Seed inside the DATA box, inset from its edge so seeds aren't
+    // immediately clipped away. Seeding across the whole viewport instead
+    // would place most seeds where there are no observations at all.
+    let x = dataBoxPx[0] + boxW * (0.08 + 0.84 * u);
+    let y = dataBoxPx[1] + boxH * (0.08 + 0.84 * v);
 
     const trace: Array<[number, number]> = [];
     let sumSpeed = 0;
     let samples = 0;
+    /** Heading of the previous step, for the turn clamp. */
+    let prevHeading: number | null = null;
 
     for (let s = 0; s < steps; s++) {
       const [lat, lon] = unproject(x, y);
@@ -159,43 +269,90 @@ export function buildWindStreamlines(
       const gj = -(lat - originLat) / spacing;
 
       const speed = bilinear(grid, gi, gj, (p) => p.windSpeed);
-      const dirDeg = bilinear(grid, gi, gj, (p) => p.windDir);
-      if (speed === null || dirDeg === null) break;
+      // Interpolate the direction as a VECTOR, never as degrees — see
+      // towardEast/towardSouth for why.
+      const u = bilinear(grid, gi, gj, towardEast);
+      const v = bilinear(grid, gi, gj, towardSouth);
+      if (speed === null || u === null || v === null) break;
+
+      // Opposing samples can cancel the interpolated vector to nothing, which
+      // leaves no direction to follow. Stop rather than invent one.
+      const mag = Math.hypot(u, v);
+      if (!(mag > 1e-6)) break;
+
+      // Screen-space heading: 0 = east, 90 = south (y grows downward).
+      let heading = (Math.atan2(v, u) / DEG);
+      if (prevHeading !== null) {
+        const delta = wrap180(heading - prevHeading);
+        if (Math.abs(delta) > MAX_TURN_DEG) {
+          heading = prevHeading + Math.sign(delta) * MAX_TURN_DEG;
+        }
+      }
+      prevHeading = heading;
 
       sumSpeed += speed;
       samples++;
 
-      // Meteorological direction is where wind comes FROM; the vector it
-      // blows toward is +180deg. Circular mean handles the 0/360 wrap that a
-      // naive average would break.
-      const towards = ((((dirDeg + 180) % 360) + 360) % 360) * (Math.PI / 180);
-      const vx = Math.sin(towards);
-      const vy = -Math.cos(towards);
-
       // One degree of lon spans cos(lat) as much ground as one degree of lat,
       // so correct the x step to keep the on-screen path from shearing.
-      const cosLat = Math.cos((lat * Math.PI) / 180);
+      const cosLat = Math.cos(lat * DEG);
       const safeCos = cosLat > 0.2 ? cosLat : 0.2;
       const stepDeg = MAX_STEP_PX / spacing;
-      x += vx * stepDeg * safeCos;
-      y += vy * stepDeg;
+      const rad = heading * DEG;
+      x += Math.cos(rad) * stepDeg * safeCos;
+      y += Math.sin(rad) * stepDeg;
 
-      if (x < minX - 40 || x > maxX + 40 || y < minY - 40 || y > maxY + 40) break;
+      if (x < dataBoxPx[0] || x > dataBoxPx[2] || y < dataBoxPx[1] || y > dataBoxPx[3]) break;
       trace.push([x, y]);
     }
 
     // A streamline needs enough length to read as a flowing line, not a dot.
     if (trace.length < (overview ? 6 : 12)) continue;
 
+    // Drop near-duplicate paths so the field stays evenly spread instead of
+    // combing where many seeds happen to follow the same streamline.
+    const mid = trace[Math.floor(trace.length / 2)];
+    const minSep = Math.max(
+      MIN_SEPARATION_PX,
+      Math.min(MAX_SEPARATION_PX, Math.round(Math.min(boxW, boxH) * SEPARATION_FRACTION)),
+    );
+    let tooClose = false;
+    for (const other of kept) {
+      if (Math.hypot(other[0] - mid[0], other[1] - mid[1]) < minSep) {
+        tooClose = true;
+        break;
+      }
+    }
+    if (tooClose) continue;
+    kept.push(mid);
+
     const meanSpeed = samples ? sumSpeed / samples : 0;
     const ws = windStyleFn(meanSpeed, maxWind);
-    const norm = maxWind > 0 ? Math.min(1, Math.max(0, meanSpeed / maxWind)) : 0.35;
+    /**
+     * Normalise across the OBSERVED wind range, not from zero.
+     *
+     * Dividing by `maxWind` alone put every line at norm ~= 0.8: an ordinary
+     * day is nowhere near the grid maximum, so the whole field pinned itself
+     * to the thick end of the scale and the width stopped carrying any
+     * information. Spanning min..max makes the stroke weight genuinely track
+     * the data — a light reading lands thin, only real gusts read heavy.
+     */
+    const windSpan = Math.max(1e-6, maxWind - minWind);
+    const norm = Math.min(1, Math.max(0, (meanSpeed - minWind) / windSpan));
 
     out.push({
       d: toSmoothPath(trace),
       color: windColorFn(norm),
-      opacity: Math.max(MIN_OPACITY, ws.opacity * (overview ? 0.6 : 1)),
-      width: overview ? 1.1 + norm * 1.1 : 1.3 + norm * 2.5,
+      opacity: Math.max(MIN_OPACITY, ws.opacity * (overview ? 0.7 : 1)),
+      /**
+       * Stroke weight carries the speed reading, but it has to stay a LINE.
+       * At the previous 3 + norm*2.6 (3.0-5.6px, measuring ~5.1px across the
+       * board) the field read as bold decorative bands and buried the isobar
+       * contours underneath. These ranges keep the core at roughly 1.5-2.6px
+       * in focus and 1.1-1.7px in the combined overview, so the layer reads as
+       * airflow rather than as filled shapes.
+       */
+      width: overview ? 1.05 + norm * 0.6 : 1.45 + norm * 1.15,
       // Stagger phase so the field shimmers rather than pulsing as one block.
       dashOffset: Math.abs(trace[0][0] * 0.6 + trace[0][1] * 1.4) % 48,
       dashDuration: Math.max(1.5, 4.4 - norm * 2.4),

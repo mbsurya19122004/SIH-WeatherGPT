@@ -114,6 +114,12 @@ test('sanitize: valid coords + real source pass through, region/country kept', (
     longitude: 77.32,
     name: 'Noida',
     region: 'Uttar Pradesh',
+    // `district` was added to SelectedLocation for IMD warning bulletins and
+    // is deliberately absent from this search result, but `sanitize` always
+    // returns the key (as undefined) so the shape stays stable. deepEqual
+    // distinguishes a missing key from an explicit undefined, so the
+    // expectation has to list it.
+    district: undefined,
     country: 'India',
     source: 'search',
   });

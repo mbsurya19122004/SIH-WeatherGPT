@@ -5,7 +5,13 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host",
-    "build": "tsc -b && vite build"
+    "build": "tsc -b && vite build",
+    "typecheck": "tsc -b --noEmit",
+    "lint": "eslint src",
+    "test": "node --test ../tests/*.test.ts",
+    "test:browser": "node --test ../tests/browser/*.mjs 2>/dev/null || for f in ../tests/browser/*.mjs; do node \"$f\" || exit 1; done",
+    "test:live": "../.venv/bin/python ../ML/live_plan.py",
+    "test:live:dry": "../.venv/bin/python ../ML/live_plan.py --dry-run"
   },
   "dependencies": {
     "@hugeicons/react": "^1.1.10",
@@ -39,9 +45,12 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
     "@vitejs/plugin-react": "^6.1.0",
+    "eslint": "^9.39.5",
+    "eslint-plugin-react-hooks": "^5.2.0",
     "oxlint": "^1.79.0",
     "playwright": "^1.63.0",
     "typescript": "~6.0.2",
+    "typescript-eslint": "^8.70.1",
     "vite": "^8.2.2"
   }
 }

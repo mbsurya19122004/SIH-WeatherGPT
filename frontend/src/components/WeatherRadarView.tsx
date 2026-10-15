@@ -317,13 +317,19 @@ function RadarWithLocation({
     if (dotRef.current) {
       dotRef.current.setLatLng([lat, lon]);
     } else {
+      // As on the map view: `interactive: false` means this is not a control,
+      // so Leaflet's default role="button" and tabindex="0" are false promises.
+      // `keyboard: false` removes both; `alt`/`title` still name the place.
       dotRef.current = L.marker([lat, lon], {
         icon: L.divIcon({
-          className: '',
+          className: 'map-loc-dot-marker',
           html: '<div class="map-loc-dot"></div>',
           iconSize: [12, 12],
           iconAnchor: [6, 6],
         }),
+        alt: `Radar location: ${location.name || 'selected point'}`,
+        title: location.name || 'Selected point',
+        keyboard: false,
         interactive: false,
         zIndexOffset: 900,
       }).addTo(map);

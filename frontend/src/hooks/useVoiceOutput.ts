@@ -57,7 +57,7 @@ export function prepareWeatherSpeechText(raw: string): string {
   text = text.replace(/\*(.*?)\*/g, '$1');     // italics
   text = text.replace(/`([^`]+)`/g, '$1');     // inline code
   text = text.replace(/^#+\s+/gm, '');         // headers
-  text = text.replace(/^[•\-\*]\s+/gm, '');    // bullets
+  text = text.replace(/^[•\-*]\s+/gm, '');    // bullets
   text = text.replace(/•/g, ',');
 
   // 5. Expand abbreviations for fluent audio delivery

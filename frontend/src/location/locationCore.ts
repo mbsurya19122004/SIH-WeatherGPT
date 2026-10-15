@@ -27,10 +27,33 @@ export interface SelectedLocation {
   name: string;
   /** Admin1 (state / county) when the source provides it. */
   region?: string;
+  /**
+   * Administrative DISTRICT, resolved by reverse geocoding — e.g. "Kochi".
+   *
+   * This is deliberately NOT derived from `name`. The display name and the
+   * district are different concepts: `name` may be a fully qualified
+   * "Kochi, Kerala, India", a POI, or "Selected point", and appending
+   * "district" to any of those produces nonsense like
+   * "Kochi, Kerala, India district" — which is exactly what an IMD warning
+   * must never be labelled with. Anything needing a district (warning
+   * bulletins, and only for India) reads this field.
+   */
+  district?: string;
   /** Country when the source provides it. */
   country?: string;
   /** How this location was selected — auditable, never user-visible. */
   source: LocationSource;
+}
+
+/**
+ * India-specific warning bulletins (IMD) are only meaningful inside India.
+ *
+ * This is the single gate for IMD warning requests: a resolved country that
+ * is not "India" must never reach the IMD endpoint, because the response
+ * would be an Indian district warning attached to a foreign coordinate.
+ */
+export function isInIndia(loc: Pick<SelectedLocation, 'country'> | null | undefined): boolean {
+  return typeof loc?.country === 'string' && loc.country.trim().toLowerCase() === 'india';
 }
 
 /** Coordinate range guard for latitudes: must be a finite number in [-90, 90]. */
@@ -67,6 +90,7 @@ export function sanitize(raw: unknown): SelectedLocation | null {
     longitude: o.longitude as number,
     name,
     region: typeof o.region === 'string' ? o.region : undefined,
+    district: typeof o.district === 'string' ? o.district : undefined,
     country: typeof o.country === 'string' ? o.country : undefined,
     source: o.source as LocationSource,
   };
@@ -102,6 +126,71 @@ export function parseDeepLink(search: string): SelectedLocation | null {
     name: params.get('name') ?? SELECTED_POINT_LABEL,
     source: 'url',
   });
+}
+
+// ── Session persistence (P2-004) ─────────────────────────────────────
+//
+// The selected location is the input to every data page, so losing it on
+// refresh meant re-picking a city on every reload. It is restored from
+// localStorage on boot.
+//
+// This reverses an earlier decision recorded in this codebase ("no
+// localStorage read, no default city"). The reasoning still holds for a
+// *default* city: nothing here invents a location. A stored value is only ever
+// a location the user actually chose, and it is re-validated through
+// `sanitize()` on read, so a hand-edited or stale entry cannot inject an
+// out-of-range coordinate or an unknown `source`.
+//
+// Priority on boot is unchanged: a deep link in the URL wins over the stored
+// value, so a shared link always shows the place it names.
+
+const STORAGE_KEY = 'weathergpt.selectedLocation.v1';
+
+/**
+ * Read the previously selected location.
+ *
+ * Returns null — never throws — when localStorage is unavailable (Safari
+ * private mode, disabled cookies, a quota-exhausted origin) or when the stored
+ * value is absent, unparseable, or fails `sanitize`. An empty or blocked store
+ * therefore degrades to the previous behaviour: no location, no requests.
+ */
+export function loadStoredLocation(): SelectedLocation | null {
+  if (typeof window === 'undefined') return null;
+  let raw: string | null = null;
+  try {
+    raw = window.localStorage.getItem(STORAGE_KEY);
+  } catch {
+    // Storage blocked or unavailable. Not an error worth surfacing: the app
+    // simply starts with no location, exactly as it did before.
+    return null;
+  }
+  if (!raw) return null;
+  try {
+    return sanitize(JSON.parse(raw));
+  } catch {
+    // Corrupt entry. Drop it so it cannot fail again on every future load.
+    try {
+      window.localStorage.removeItem(STORAGE_KEY);
+    } catch {
+      /* nothing further to do */
+    }
+    return null;
+  }
+}
+
+/** Persist the selected location. Silently no-ops when storage is blocked. */
+export function storeLocation(loc: SelectedLocation | null): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (loc === null) {
+      window.localStorage.removeItem(STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(loc));
+  } catch {
+    // Quota exceeded or storage blocked: persistence is a convenience, so
+    // failing to save must never break the interaction that triggered it.
+  }
 }
 
 /**

@@ -21,6 +21,7 @@ import {
   Wind,
   ChevronDown,
   ChevronUp,
+  ShieldOff,
 } from 'lucide-react';
 import AIChatWorkspace from './components/AIChatWorkspace';
 import AppHeader from './components/AppHeader';
@@ -48,7 +49,7 @@ import {
   useLocation,
   type SelectedLocation,
 } from './location/LocationContext';
-import { reportCacheKey } from './location/locationCore';
+import { reportCacheKey, isInIndia } from './location/locationCore';
 
 // ─────────────────────────────────────────────────────────────────────
 // Types
@@ -146,13 +147,93 @@ const DEMO_WARNING: ImdWarning = {
 // Weather report helpers (offline-capable)
 // ─────────────────────────────────────────────────────────────────────
 
-async function geocodeCity(city: string): Promise<GeoResult> {
-  const res = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=en&format=json`);
+/**
+ * Look up a city name.
+ *
+ * `count=10` rather than `count=1` so an AMBIGUOUS name can be detected.
+ * With `count=1` the geocoder silently returned the single highest-ranked
+ * match, and for "Kochi" that is Kochi **Japan** (33.55N 133.53E) — while
+ * "Kochi, Kerala" resolves to Kochi **India** (9.94N 76.26E). The report then
+ * displayed one unqualified name over whichever result came back, so a user
+ * asking about an Indian city could be shown another country's weather, with
+ * an official IMD warning for Kerala rendered directly above it.
+ *
+ * The full candidate list is deliberately NOT auto-resolved to a single place:
+ * picking one silently would recreate the original bug. When more than one
+ * candidate shares the queried name, the caller must disambiguate (see
+ * `isAmbiguousName` / `CITY_CANDIDATES`).
+ */
+const CITY_CANDIDATES = 10;
+
+interface CityCandidate extends GeoResult {
+  /** Admin1 (state/region) from the geocoder, when present. */
+  region?: string;
+  /**
+   * Administrative district, reverse-geocoded from the resolved coordinates.
+   *
+   * The forward geocoder does not return a district, and it must not be
+   * derived from the display name: "Kochi, Kerala, India district" is not a
+   * district. Warning bulletins read this field instead.
+   */
+  district?: string;
+}
+
+/** Reverse-geocode just the administrative fields a candidate needs. */
+async function resolveDistrict(c: CityCandidate): Promise<CityCandidate> {
+  try {
+    const r = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?lat=${c.latitude}&lon=${c.longitude}` +
+      `&format=jsonv2&zoom=10`,
+    );
+    if (!r.ok) return c;
+    const a = (await r.json())?.address ?? {};
+    return { ...c, district: a.county ?? a.city_district ?? undefined };
+  } catch {
+    return c;
+  }
+}
+
+async function geocodeCityCandidates(city: string): Promise<CityCandidate[]> {
+  const res = await fetch(
+    `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}` +
+    `&count=${CITY_CANDIDATES}&language=en&format=json`,
+  );
   if (!res.ok) throw new Error('Unable to look up that location.');
   const data = await res.json();
   if (!data.results?.length) throw new Error('Location not found.');
-  const r = data.results[0];
-  return { latitude: r.latitude, longitude: r.longitude, name: r.name, country: r.country };
+  return data.results.map((r: any) => ({
+    latitude: r.latitude,
+    longitude: r.longitude,
+    name: r.name,
+    country: r.country,
+    region: r.admin1,
+  }));
+}
+
+/**
+ * True when the query matched more than one DISTINCT place that a user could
+ * have meant — i.e. candidates sharing the searched name in different
+ * countries/regions. Diacritic and width variants of the same name
+ * ("Kochi" / "Kōchi") are the same place and must not trigger this.
+ */
+function isAmbiguousName(query: string, candidates: CityCandidate[]): boolean {
+  // Written with an explicit \u escape: a literal combining-mark range in source
+  // is invisible and easy to corrupt in an edit, which would silently stop
+  // diacritics being folded (so "Kōchi" and "Kochi" would not compare equal).
+  const norm = (s: string) =>
+    s.normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
+  const wanted = norm(query.split(',')[0]);
+  const places = new Set<string>();
+  for (const c of candidates) {
+    if (norm(c.name) !== wanted) continue;
+    places.add(`${norm(c.country ?? '')}|${norm(c.region ?? '')}`);
+  }
+  return places.size > 1;
+}
+
+/** "Kochi, Kerala, India" — the disambiguated display name for a place. */
+function qualifiedName(c: CityCandidate): string {
+  return [c.name, c.region, c.country].filter(Boolean).join(', ');
 }
 
 async function fetchForecastRecord(place: GeoResult): Promise<ForecastRecord> {
@@ -258,6 +339,9 @@ const S: Record<string, React.CSSProperties> = {
 // Token-based panel for rail/drawer destinations.
 const P: Record<string, React.CSSProperties> = {
   panel: { background: 'var(--paper)', border: '1px solid var(--line)', borderRadius: 'var(--radius-card)', padding: '18px', display: 'flex', flexDirection: 'column', gap: '14px' },
+  /* `h1` and `h2` deliberately share one style: promoting a page heading from
+     h2 to h1 must be a semantics-only change, never a visual one. */
+  h1: { margin: 0, fontSize: '19px', fontWeight: 600, color: 'var(--ink)', fontFamily: 'var(--font-display)', letterSpacing: '-0.01em' },
   h2: { margin: 0, fontSize: '19px', fontWeight: 600, color: 'var(--ink)', fontFamily: 'var(--font-display)', letterSpacing: '-0.01em' },
   metaCard: { background: 'var(--mist)', border: '1px solid var(--line)', borderRadius: 'var(--radius-card)', padding: '10px 12px' },
   mono: { fontFamily: 'var(--font-mono)' },
@@ -458,13 +542,48 @@ function RouteWeatherView() {
   const [expandedDetails, setExpandedDetails] = useState<Set<number>>(new Set());
   const [activeRouteIndex, setActiveRouteIndex] = useState(0);
 
+  // P2-005: both endpoints are required, and saying so before the click beats
+  // a silent no-op. The hint names exactly which field is missing.
+  const trimmedOrigin = form.origin.trim();
+  const trimmedDestination = form.destination.trim();
+  const missing: string[] = [];
+  if (!trimmedOrigin) missing.push('a starting point');
+  if (!trimmedDestination) missing.push('a destination');
+  const canAnalyze = missing.length === 0;
+  const missingHint =
+    missing.length === 2
+      ? 'Enter a starting point and a destination to analyze a route.'
+      : `Enter ${missing[0]} to analyze a route.`;
+
+  // P2-006: never surface a raw exception, status line or stack to the user.
+  // Map the failure to plain language; the technical detail goes to the
+  // console for whoever is debugging.
+  const describeRouteFailure = (status: number): string => {
+    if (status === 400) return 'That route could not be understood. Check both place names and try again.';
+    if (status === 404) return 'No route was found between those places. Try nearby or larger town names.';
+    if (status === 408 || status === 504) return 'The route service took too long to answer. Please try again.';
+    if (status >= 500) return 'The route service is having trouble right now. Please try again in a moment.';
+    return 'The route could not be analyzed right now. Please try again.';
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault(); setLoading(true); setErr(null); setResp(null); setExpandedDetails(new Set()); setActiveRouteIndex(0);
+    e.preventDefault();
+    if (!canAnalyze || loading) { setErr(null); return; }
+    setLoading(true); setErr(null); setResp(null); setExpandedDetails(new Set()); setActiveRouteIndex(0);
     try {
-      const res = await fetch(ML_ROUTE_ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(form) });
-      if (!res.ok) throw new Error(`Error ${res.status} - ${res.statusText}`);
+      const res = await fetch(ML_ROUTE_ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...form, origin: trimmedOrigin, destination: trimmedDestination }) });
+      if (!res.ok) {
+        console.warn(`[route-weather] ${res.status} ${res.statusText}`);
+        setErr(describeRouteFailure(res.status));
+        return;
+      }
       setResp(await res.json());
-    } catch (e: any) { setErr(e.message || 'Failed to fetch route weather.'); }
+    } catch (e) {
+      // Transport-level only (offline, DNS, CORS, aborted). The message is
+      // generated here rather than echoed, so nothing internal can leak.
+      console.warn('[route-weather] transport failure', e);
+      setErr('Could not reach the route service. Check your connection and try again.');
+    }
     finally { setLoading(false); }
   };
 
@@ -505,7 +624,7 @@ function RouteWeatherView() {
   return (
     <div style={S.card}>
       <header>
-        <h2 style={P.h2}>Route weather analyzer</h2>
+        <h1 style={P.h1}>Route weather analyzer</h1>
         <p style={{ margin: '4px 0 0', fontSize: '13px', color: 'var(--muted)' }}>Check conditions and risk along a journey, point by point.</p>
       </header>
 
@@ -536,7 +655,15 @@ function RouteWeatherView() {
               autoComplete="off" />
           </div>
         </div>
-        <button type="submit" disabled={loading} style={S.btn}>{loading ? 'Analyzing route…' : 'Analyze route'}</button>
+        <button type="submit" disabled={loading || !canAnalyze} style={S.btn}
+          aria-describedby={canAnalyze ? undefined : 'route-missing-hint'}>
+          {loading ? 'Analyzing route…' : 'Analyze route'}
+        </button>
+        {!canAnalyze && !loading && (
+          <p id="route-missing-hint" role="status" style={{ ...S.label, margin: 0, fontWeight: 400 }}>
+            {missingHint}
+          </p>
+        )}
       </form>
 
       {err && <div style={S.error}>{err}</div>}
@@ -1080,6 +1207,11 @@ function WeatherReportView() {
   );
   const [loading, setLoading] = useState(false);
   const [banner, setBanner] = useState<{ tone: 'error' | 'info'; text: string } | null>(null);
+  /**
+   * Populated only when the searched name is ambiguous ("Kochi" matches
+   * Kochi Japan AND Kochi Kerala). The user picks; the app never guesses.
+   */
+  const [candidates, setCandidates] = useState<CityCandidate[]>([]);
   const [online, setOnline] = useState(navigator.onLine);
   const lastKeyRef = useRef('');
 
@@ -1136,26 +1268,95 @@ function WeatherReportView() {
     }
     setLoading(true); setBanner(null);
     try {
-      const place = await geocodeCity(city);
+      const candidates = await geocodeCityCandidates(city);
+
+      // An ambiguous name is never resolved silently. Picking the top hit is
+      // exactly the defect this guards against: "Kochi" would land on Kochi
+      // Japan while the user meant Kochi, Kerala, and an IMD warning for Kerala
+      // would be rendered above Japanese weather. The user chooses instead.
+      if (isAmbiguousName(city, candidates)) {
+        setCandidates(candidates.filter((c) => c.name.toLowerCase() === city.split(',')[0].trim().toLowerCase()));
+        setLoading(false);
+        return;
+      }
+
+      const place = await resolveDistrict(candidates[0]);
       // Search selects the canonical location: every location-aware feature
       // (map, radar, warnings, chat context) now follows the searched city.
-      setLocation({ latitude: place.latitude, longitude: place.longitude, name: place.name, country: place.country, source: 'search' });
+      // The stored name is QUALIFIED with region + country so no downstream
+      // surface can present an ambiguous name unqualified again, and the
+      // district is stored SEPARATELY for warning bulletins.
+      setLocation({
+        latitude: place.latitude,
+        longitude: place.longitude,
+        name: qualifiedName(place),
+        country: place.country,
+        region: place.region,
+        district: place.district,
+        source: 'search',
+      });
+      setCandidates([]);
       setCityInput('');
       setLoading(false); // same-coords search won't re-trigger the location effect
     } catch (e: any) {
+      setCandidates([]);
       if (record) setBanner({ tone: 'info', text: `${e.message} Showing cached forecast.` });
       else setBanner({ tone: 'error', text: e.message });
       setLoading(false);
     }
   };
 
+  /** Apply a candidate the user picked from the disambiguation list. */
+  const chooseCandidate = async (c: CityCandidate) => {
+    const place = await resolveDistrict(c);
+    setLocation({
+      latitude: place.latitude,
+      longitude: place.longitude,
+      name: qualifiedName(place),
+      country: place.country,
+      region: place.region,
+      district: place.district,
+      source: 'search',
+    });
+    setCandidates([]);
+    setCityInput('');
+    setLoading(false);
+  };
+
   const fmtTime = (t: string) => new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
   const fmtDay = (t: string) => new Date(t).toLocaleDateString([], { weekday: 'long' });
+
+  /**
+   * P3-016: a saved report's timestamp, in the app's existing format
+   * ("05:30 IST, 23 Sep" — the same shape used for advisory issue times).
+   *
+   * `toLocaleString()` was previously used with no options, which emitted
+   * locale-dependent output including seconds ("9/28/2026, 6:39:02 AM"). The
+   * stored value is an ISO-8601 string, so anything that fell through to
+   * rendering it directly would also expose the raw format and, on some
+   * backends, microsecond precision. This never emits the raw string.
+   */
+  const fmtSavedAt = (iso: string): string => {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return 'an unknown time';
+    try {
+      const time = new Intl.DateTimeFormat('en-IN', {
+        hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Kolkata',
+      }).format(d);
+      const day = new Intl.DateTimeFormat('en-IN', {
+        day: '2-digit', month: 'short', timeZone: 'Asia/Kolkata',
+      }).format(d);
+      return `${time} IST, ${day}`;
+    } catch {
+      // Older engine without full ICU: still human-readable, never ISO.
+      return d.toLocaleString();
+    }
+  };
 
   return (
     <div style={S.card}>
       <header>
-        <h2 style={P.h2}>Weather report</h2>
+        <h1 style={P.h1}>Weather report</h1>
         <p style={{ margin: '4px 0 0', fontSize: '13px', color: 'var(--muted)' }}>Search any city. Forecast is cached for offline use.</p>
       </header>
 
@@ -1164,7 +1365,14 @@ function WeatherReportView() {
           <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: online ? 'var(--slate-teal)' : 'var(--muted)' }} />
           {online ? 'Online' : 'Offline'}
         </span>
-        <input style={{ ...S.input, flex: 1, minWidth: '180px' }} type="text" value={cityInput}
+        {/* A placeholder is not an accessible name — it disappears on input and
+            is announced inconsistently — so the field carries a real, visually
+            hidden label. Matches the pattern the Route form already uses for
+            Origin / Destination. */}
+        <label className="sr-only" htmlFor="report-city-input">City to look up</label>
+        <input id="report-city-input" style={{ ...S.input, flex: 1, minWidth: '180px' }} type="text" value={cityInput}
+          aria-expanded={candidates.length > 0}
+          aria-controls={candidates.length > 0 ? 'report-city-candidates' : undefined}
           onChange={e => setCityInput(e.target.value)} onKeyDown={e => e.key === 'Enter' && search()}
           placeholder="Enter a city" />
         <button onClick={() => search()} disabled={loading}
@@ -1175,6 +1383,35 @@ function WeatherReportView() {
 
       {banner && <div style={banner.tone === 'error' ? S.error : S.successBanner}>{banner.text}</div>}
 
+      {/* Ambiguous name — the user chooses the place. Each option is labelled
+          with its region and country so the choice is unambiguous, and each
+          exposes its coordinates to assistive tech. */}
+      {candidates.length > 0 && (
+        <div id="report-city-candidates" role="group" aria-label="Choose a location" style={{ ...S.card, marginTop: '10px' }}>
+          <p style={{ margin: '0 0 8px', fontSize: '13px', color: 'var(--muted)' }}>
+            More than one place is called that. Pick the one you mean.
+          </p>
+          <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gap: '6px' }}>
+            {candidates.map((c, i) => (
+              <li key={`${c.latitude},${c.longitude},${i}`}>
+                <button
+                  type="button"
+                  onClick={() => chooseCandidate(c)}
+                  style={{ ...S.btn, width: '100%', justifyContent: 'flex-start', textAlign: 'left' }}
+                >
+                  <span>
+                    {qualifiedName(c)}
+                    <span style={{ display: 'block', fontSize: '11px', color: 'var(--muted)', fontFamily: 'var(--font-mono)' }}>
+                      {c.latitude.toFixed(2)}, {c.longitude.toFixed(2)}
+                    </span>
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       {!record && !loading && (
         <div style={S.card}><p style={{ margin: 0, color: 'var(--muted)', fontSize: '13px' }}>Search a city to load a forecast.</p></div>
       )}
@@ -1184,7 +1421,7 @@ function WeatherReportView() {
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '10px' }}>
             <div>
               <h3 style={{ ...S.cardTitle, marginBottom: 2 }}>{record.location.name}{record.location.country ? `, ${record.location.country}` : ''}</h3>
-              <p style={{ margin: 0, fontSize: '11px', color: 'var(--muted)', fontFamily: 'var(--font-mono)' }}>Updated {new Date(record.savedAt).toLocaleString()}</p>
+              <p style={{ margin: 0, fontSize: '11px', color: 'var(--muted)', fontFamily: 'var(--font-mono)' }}>Updated {fmtSavedAt(record.savedAt)}</p>
             </div>
             <div style={{ fontSize: '2.2rem', fontWeight: 800, color: 'var(--slate-teal)', fontVariantNumeric: 'tabular-nums' }}>{Math.round(record.hourly24h.temperature[0])}°C</div>
           </div>
@@ -1239,7 +1476,7 @@ function NoLocation({ feature }: { feature: string }) {
   return (
     <div style={P.panel} className="page-panel">
       <header>
-        <h2 style={P.h2}>{feature}</h2>
+        <h1 style={P.h1}>{feature}</h1>
       </header>
       <div style={{ textAlign: 'center', padding: '40px 24px', color: 'var(--muted)' }}>
         <MapPin size={30} style={{ margin: '0 auto 12px', opacity: 0.6 }} />
@@ -1264,6 +1501,27 @@ export default function App() {
   // ── Navigation: chat is the primary view; rail/drawer hold the rest ──
   const [activePage, setActivePage] = useState<NavPage | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
+
+  /**
+   * P3-013: lock body scroll while the mobile drawer is open.
+   *
+   * The drawer is a full-height overlay, but the page behind it still scrolled
+   * on touch, so dragging inside the drawer could move the content underneath
+   * and leave the drawer visually detached from what the user was reading.
+   *
+   * The previous inline `overflow` value is captured and restored, so this
+   * composes with any other code that also manages body overflow instead of
+   * blindly overwriting it.
+   */
+  useEffect(() => {
+    if (!drawerOpen) return;
+    const { body } = document;
+    const previousOverflow = body.style.overflow;
+    body.style.overflow = 'hidden';
+    return () => {
+      body.style.overflow = previousOverflow;
+    };
+  }, [drawerOpen]);
 
   // ── Chat language: feeds the header toggle AND the AI chat's
   // placeholder/voice locale (the chat itself lives in AIChatWorkspace).
@@ -1477,10 +1735,32 @@ export default function App() {
       if (!signal.aborted) setSectorLoading(false);
     }
   };
+  /**
+   * IMD early warnings — INDIA ONLY.
+   *
+   * IMD publishes warnings for Indian districts. Requesting them for a
+   * foreign coordinate returns an Indian warning that then renders above that
+   * country's forecast under the user's chosen place name, which is both
+   * wrong and alarming. The resolved country is the gate: a non-India location
+   * makes ZERO requests here and shows an explicit no-coverage state instead.
+   */
   const fetchAlerts = async (
     loc: SelectedLocation,
     signal: AbortSignal,
   ) => {
+    if (!isInIndia(loc)) {
+      setAlertsList([]);
+      return;
+    }
+    // P3-014: a restored location is a prior choice, not evidence of where the
+    // user is now. IMD warnings describe conditions at a place, so presenting
+    // them against a remembered location without that caveat would assert
+    // something about the user's current situation that we cannot support. The
+    // bulletin is withheld until a live fix or explicit choice replaces it.
+    if (locationState.status === 'restored') {
+      setAlertsList([]);
+      return;
+    }
     try {
       const r = await fetch(ALERTS_ENDPOINT(loc.name, toWeatherQuery(loc)), { signal });
       if (!r.ok) throw new Error(await describeHttpError(r));
@@ -1525,13 +1805,29 @@ export default function App() {
     const text = a.description || a.warning || a.message || '';
     if (!text) return null;
     return {
-      district: `${location.name} district`,
+      /**
+       * The RESOLVED district, never the display name. `name` may be
+       * "Kochi, Kerala, India" or "Selected point", and appending "district"
+       * to those produced labels like "Kochi, Kerala, India district" — a
+       * category error on a safety banner. Falls back to the location's own
+       * name only when reverse geocoding genuinely resolved no district.
+       */
+      district: location.district
+        ? `${location.district} district`
+        : undefined,
       severity: severityOf(a),
       title: a.title || undefined,
       text,
       issuedAt: a.issuedAt ?? a.issueTime ?? a.issued ?? undefined,
     };
   }, [alertsList, location]);
+
+  /**
+   * True when a location is outside India and IMD simply has nothing for it.
+   * Distinct from "no warning is active" (green) — the product says so plainly
+   * rather than implying an all-clear.
+   */
+  const imdOutOfScope = !!location && !isInIndia(location);
 
   const handleNavigate = (page: NavPage) => {
     setActivePage(page);
@@ -1541,6 +1837,25 @@ export default function App() {
   const navigateHome = () => {
     setActivePage(null);
     setDrawerOpen(false);
+  };
+
+  /**
+   * P2-007: the location pill must never be a dead control.
+   *
+   * A pill that only re-requests GPS is useless in the one case where a user
+   * most needs it. Per the geolocation spec, once permission is DENIED the
+   * browser will not prompt again, so calling getCurrentPosition repeats the
+   * same failure forever and the pill appears to do nothing. In that state the
+   * only route forward is manual entry, so the pill takes the user to the
+   * search field. For a transient failure (position unavailable, timeout) a
+   * retry is genuinely worth attempting, so that is what it does.
+   */
+  const handleLocationPill = () => {
+    if (locationState.status === 'denied') {
+      handleNavigate('report');
+      return;
+    }
+    requestGpsLocation();
   };
 
   // ── Render ──
@@ -1571,12 +1886,12 @@ export default function App() {
           onLanguageChange={setSelectedLang}
           theme={theme}
           onToggleTheme={toggleTheme}
-          onLocationClick={requestGpsLocation}
+          onLocationClick={handleLocationPill}
           drawerOpen={drawerOpen}
           onToggleDrawer={() => setDrawerOpen(v => !v)}
         />
 
-        <WarningBulletin warning={activeWarning} />
+        <WarningBulletin warning={activeWarning} outOfScope={imdOutOfScope} />
 
         {onChat ? (
           <AIChatWorkspace lang={selectedLang} />
@@ -1586,7 +1901,7 @@ export default function App() {
               {activePage === 'forecast' && (location ? (
                 <div style={P.panel} className="page-panel">
                   <header>
-                    <h2 style={P.h2}>7-Day Forecast for {location.name}</h2>
+                    <h1 style={P.h1}>7-Day Forecast for {location.name}</h1>
                   </header>
                   {forecastError && forecastList.length === 0 ? (
                     <div style={S.error} role="alert">
@@ -1620,7 +1935,7 @@ export default function App() {
                   {nwpComparison && nwpComparison.models.length > 0 && (
                     <div style={P.panel} className="page-panel">
                       <header>
-                        <h2 style={P.h2}>NWP Multi-Model Ensemble for {location.name}</h2>
+                        <h1 style={P.h1}>NWP Multi-Model Ensemble for {location.name}</h1>
                       </header>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
                         <span style={{ ...S.badge, background: 'var(--slate-teal-tint)', color: 'var(--slate-teal)', borderColor: 'var(--slate-teal)' }}>
@@ -1646,7 +1961,7 @@ export default function App() {
                   {nwpComparison && nwpComparison.models.length === 0 && (
                     <div style={P.panel} className="page-panel">
                       <header>
-                        <h2 style={P.h2}>NWP Multi-Model Ensemble for {location.name}</h2>
+                        <h1 style={P.h1}>NWP Multi-Model Ensemble for {location.name}</h1>
                       </header>
                       <p style={{ textAlign: 'center', padding: '24px', color: 'var(--muted)', margin: 0 }}>
                         No NWP model data is currently available.
@@ -1657,7 +1972,7 @@ export default function App() {
                   {nwpError && !nwpComparison && (
                     <div style={P.panel} className="page-panel">
                       <header>
-                        <h2 style={P.h2}>NWP Multi-Model Ensemble for {location.name}</h2>
+                        <h1 style={P.h1}>NWP Multi-Model Ensemble for {location.name}</h1>
                       </header>
                       <div style={S.error} role="alert">
                         <p style={{ margin: 0, fontWeight: 600 }}>Unable to load NWP models.</p>
@@ -1678,7 +1993,7 @@ export default function App() {
               {activePage === 'sectors' && (location ? (
                 <div style={P.panel} className="page-panel">
                   <header>
-                    <h2 style={P.h2}>Sector advisories for {location.name}</h2>
+                    <h1 style={P.h1}>Sector advisories for {location.name}</h1>
                   </header>
                   <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
                     {SECTOR_LIST.map(({ id, label, icon: Icon }) => (
@@ -1762,9 +2077,25 @@ export default function App() {
               {activePage === 'alerts' && (location ? (
                 <div style={P.panel} className="page-panel">
                   <header>
-                    <h2 style={P.h2}>IMD colour-coded early warnings for {location.name}</h2>
+                    <h1 style={P.h1}>
+                      {imdOutOfScope
+                        ? 'Weather warnings'
+                        : `IMD colour-coded early warnings for ${location.name}`}
+                    </h1>
                   </header>
-                  {alertsList.length === 0 ? (
+                  {/* Out of IMD's jurisdiction. "IMD Green" would assert that
+                      IMD surveyed this place and found nothing — a claim IMD
+                      makes nowhere outside India. Say what is actually true. */}
+                  {imdOutOfScope ? (
+                    <div style={{ textAlign: 'center', padding: '24px', color: 'var(--muted)' }}>
+                      <ShieldOff size={36} style={{ margin: '0 auto 8px' }} />
+                      <p style={{ margin: 0 }}><strong>No IMD warning coverage for this location</strong></p>
+                      <span style={{ fontSize: '12px', color: 'var(--muted)' }}>
+                        The India Meteorological Department issues warnings for districts in India,
+                        so no warning status is available for {location.name}.
+                      </span>
+                    </div>
+                  ) : alertsList.length === 0 ? (
                     <div style={{ textAlign: 'center', padding: '24px', color: 'var(--watch-green)' }}>
                       <CheckCircle size={36} style={{ margin: '0 auto 8px' }} />
                       <p style={{ margin: 0 }}><strong>IMD Green: normal weather conditions</strong></p>
@@ -1788,7 +2119,7 @@ export default function App() {
               {activePage === 'climate' && (location ? (
                 <div style={P.panel} className="page-panel">
                   <header>
-                    <h2 style={P.h2}>Climate analysis for {location.name}</h2>
+                    <h1 style={P.h1}>Climate analysis for {location.name}</h1>
                   </header>
                   {climateError && !climateInfo ? (
                     <div style={S.error} role="alert">

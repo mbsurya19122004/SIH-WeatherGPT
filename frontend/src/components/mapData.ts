@@ -19,6 +19,8 @@ export interface PointWeather {
   windSpeed: number | null;
   windDir: number | null;
   gust: number | null;
+  /** Mean sea-level pressure in hPa (null when the source omits it). */
+  pressure: number | null;
 }
 
 export interface GridPoint {
@@ -29,6 +31,8 @@ export interface GridPoint {
   windSpeed: number;
   windDir: number;
   gust: number;
+  /** MSLP in hPa. NaN marks "no real observation here". */
+  pressure: number;
 }
 
 export interface GridResult {
@@ -39,6 +43,9 @@ export interface GridResult {
   maxRain: number;
   minWind: number;
   maxWind: number;
+  /** Observed MSLP range in hPa; null when no cell returned pressure. */
+  minPressure: number | null;
+  maxPressure: number | null;
 }
 
 const GRID = 5; // 5x5 grid points around the queried location
@@ -86,7 +93,7 @@ export const NEUTRAL_MAP_VIEWPORT: [number, number] = [20, 0];
 export const NEUTRAL_MAP_ZOOM = 2;
 
 const OPEN_METEO =
-  'https://api.open-meteo.com/v1/forecast?current=temperature_2m,precipitation,wind_speed_10m,wind_direction_10m,wind_gusts_10m&wind_speed_unit=kmh';
+  'https://api.open-meteo.com/v1/forecast?current=temperature_2m,precipitation,wind_speed_10m,wind_direction_10m,wind_gusts_10m,surface_pressure&wind_speed_unit=kmh';
 
 /**
  * Hourly forecast request used by the Radar timeline: real model forecast
@@ -107,6 +114,7 @@ export async function fetchPointWeather(lat: number, lon: number): Promise<Point
     windSpeed: typeof c.wind_speed_10m === 'number' ? c.wind_speed_10m : null,
     windDir: typeof c.wind_direction_10m === 'number' ? c.wind_direction_10m : null,
     gust: typeof c.wind_gusts_10m === 'number' ? c.wind_gusts_10m : null,
+    pressure: typeof c.surface_pressure === 'number' ? c.surface_pressure : null,
   };
 }
 
@@ -150,7 +158,7 @@ function idwFill<T>(
   lat: number,
   lon: number,
   present: { lat: number; lon: number; value: T }[],
-  take: (v: T) => { temp: number | null; precip: number | null; windSpeed: number | null; windDir: number | null; gust: number | null },
+  take: (v: T) => { temp: number | null; precip: number | null; windSpeed: number | null; windDir: number | null; gust: number | null; pressure?: number | null },
 ): PointWeather | null {
   let wsum = 0;
   let temp = 0;
@@ -160,6 +168,10 @@ function idwFill<T>(
   let sinD = 0;
   let cosD = 0;
   let any = false;
+  // Pressure is filled only from cells that actually observed it, so a
+  // missing reading never poisons the interpolation with a fabricated value.
+  let pSum = 0;
+  let pWsum = 0;
   for (const c of present) {
     const t = take(c.value);
     if (t.temp == null || t.windSpeed == null) continue;
@@ -173,6 +185,10 @@ function idwFill<T>(
     gust += (t.gust ?? t.windSpeed) * w;
     sinD += Math.sin(((t.windDir ?? 0) * Math.PI) / 180) * w;
     cosD += Math.cos(((t.windDir ?? 0) * Math.PI) / 180) * w;
+    if (t.pressure != null) {
+      pSum += t.pressure * w;
+      pWsum += w;
+    }
     any = true;
   }
   if (!any) return null;
@@ -183,6 +199,7 @@ function idwFill<T>(
     windSpeed: wind / wsum,
     windDir: dir,
     gust: gust / wsum,
+    pressure: pWsum > 0 ? pSum / pWsum : null,
   };
 }
 
@@ -245,6 +262,9 @@ export async function fetchGrid(lat: number, lon: number): Promise<GridResult> {
       windSpeed: pw.windSpeed,
       windDir: pw.windDir ?? 0,
       gust: pw.gust ?? pw.windSpeed,
+      // NaN, not a guess: contouring must be able to tell "no observation"
+      // apart from a real value, or it would draw a fictional isobar.
+      pressure: typeof pw.pressure === 'number' ? pw.pressure : NaN,
     });
   }
   if (!points.length) throw new Error('Live layer data unavailable');
@@ -252,6 +272,7 @@ export async function fetchGrid(lat: number, lon: number): Promise<GridResult> {
   const temps = points.map((p) => p.temp);
   const rains = points.map((p) => p.precip);
   const winds = points.map((p) => p.windSpeed);
+  const pressures = points.map((p) => p.pressure).filter((p) => Number.isFinite(p));
   const result: GridResult = {
     points,
     minTemp: Math.min(...temps),
@@ -260,6 +281,8 @@ export async function fetchGrid(lat: number, lon: number): Promise<GridResult> {
     maxRain: Math.max(...rains),
     minWind: Math.min(...winds),
     maxWind: Math.max(...winds),
+    minPressure: pressures.length ? Math.min(...pressures) : null,
+    maxPressure: pressures.length ? Math.max(...pressures) : null,
   };
   gridCache.set(key, { at: Date.now(), data: result });
   return result;
@@ -388,6 +411,9 @@ export async function fetchRadarFrames(lat: number, lon: number): Promise<RadarF
         windSpeed: wind,
         windDir: dir,
         gust: g,
+        // The hourly radar request does not ask for pressure, so this layer
+        // never has a real MSLP value. NaN keeps the isobar renderer honest.
+        pressure: NaN,
       });
     }
     if (!points.length) continue;

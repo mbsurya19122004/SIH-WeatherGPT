@@ -139,12 +139,23 @@ const suggestions = [
 ];
 
 /* ----------------------------------------------------
+   Neutral map viewport (no-location state)
+---------------------------------------------------- */
+// Used ONLY to frame the map/radar when no location has been selected yet —
+// a world view that is deliberately "not a place". It is never sent to any
+// weather service and never stored as the canonical location; the first real
+// selection (GPS, map tap, search) re-centres the map immediately
+// (docs/location-architecture.md).
+const NEUTRAL_LAT = 20;
+const NEUTRAL_LNG = 0;
+
+/* ----------------------------------------------------
    SUB-COMPONENT: Route Weather Details View
 ---------------------------------------------------- */
 function RouteWeatherView() {
   const [formData, setFormData] = useState({
-    origin: "Delhi",
-    destination: "Agra",
+    origin: "",
+    destination: "",
     departure_time: "08:00",
   });
 
@@ -213,7 +224,7 @@ function RouteWeatherView() {
                 onChange={handleChange}
                 required
                 style={routeStyles.input}
-                placeholder="e.g. Delhi"
+                placeholder="Starting point"
               />
             </div>
 
@@ -226,7 +237,7 @@ function RouteWeatherView() {
                 onChange={handleChange}
                 required
                 style={routeStyles.input}
-                placeholder="e.g. Agra"
+                placeholder="Finish point"
               />
             </div>
 
@@ -394,7 +405,13 @@ const routeStyles: { [key: string]: React.CSSProperties } = {
    same Open-Meteo data source and localStorage caching,
    rebuilt as React state instead of direct DOM manipulation.
 ---------------------------------------------------- */
-const WEATHER_REPORT_STORAGE_KEY = "weatherGPT_offline_forecast";
+// Per-location cache keys: a forecast saved for one place must never be
+// served for another — a saved forecast is keyed by its own coordinates and
+// can only be read for exactly those coordinates. There is deliberately no
+// cross-location "last saved forecast" pointer: a no-location session or a
+// different place can never resurrect a previous pick (§location-architecture).
+const reportCacheKey = (lat: number, lon: number) =>
+  `weatherGPT_offline_forecast_${lat.toFixed(2)}_${lon.toFixed(2)}`;
 
 const WEATHER_CODE_DESCRIPTIONS: Record<number, string> = {
   0: "☀️ Clear",
@@ -510,18 +527,22 @@ async function fetchForecastRecord(place: GeoResult): Promise<ForecastRecord> {
   };
 }
 
-function loadPersistedForecast(): ForecastRecord | null {
+function loadPersistedForecast(lat?: number, lon?: number): ForecastRecord | null {
   try {
-    const saved = localStorage.getItem(WEATHER_REPORT_STORAGE_KEY);
+    // Coordinates are required: without them there is no location to cache
+    // for, and no "last saved" fallback may resurrect a previous place.
+    if (lat == null || lon == null) return null;
+    const saved = localStorage.getItem(reportCacheKey(lat, lon));
     return saved ? JSON.parse(saved) : null;
   } catch {
     return null;
   }
 }
 
-function persistForecast(record: ForecastRecord) {
+function persistForecast(record: ForecastRecord, lat: number, lon: number) {
   try {
-    localStorage.setItem(WEATHER_REPORT_STORAGE_KEY, JSON.stringify(record));
+    const key = reportCacheKey(lat, lon);
+    localStorage.setItem(key, JSON.stringify(record));
   } catch {
     // Storage full or unavailable — the report still works for this session.
   }
@@ -536,7 +557,8 @@ function WeatherReportView({ location }: { location: Coordinates | null }) {
   const autoLoadedRef = useRef(false);
 
   useEffect(() => {
-    const saved = loadPersistedForecast();
+    // This location's own cache only — never a different place's forecast.
+    const saved = loadPersistedForecast(location?.latitude, location?.longitude);
     if (saved) setRecord(saved);
 
     const goOnline = () => setOnline(true);
@@ -560,7 +582,7 @@ function WeatherReportView({ location }: { location: Coordinates | null }) {
         const name = await reverseGeocodeForReport(location.latitude, location.longitude);
         const place: GeoResult = { latitude: location.latitude, longitude: location.longitude, name };
         const next = await fetchForecastRecord(place);
-        persistForecast(next);
+        persistForecast(next, location.latitude, location.longitude);
         setRecord(next);
       } catch {
         // Silent — the user can still search manually.
@@ -578,12 +600,10 @@ function WeatherReportView({ location }: { location: Coordinates | null }) {
     }
 
     if (!online) {
-      const saved = loadPersistedForecast();
-      if (saved) {
-        setRecord(saved);
-        setBanner({ tone: "info", text: "You're offline — showing the last saved forecast." });
+      if (record) {
+        setBanner({ tone: "info", text: "You're offline — showing the cached forecast for this location." });
       } else {
-        setBanner({ tone: "error", text: "You're offline and no forecast has been saved yet." });
+        setBanner({ tone: "error", text: "You're offline and no forecast has been saved for this location yet." });
       }
       return;
     }
@@ -593,13 +613,11 @@ function WeatherReportView({ location }: { location: Coordinates | null }) {
     try {
       const place = await geocodeCity(city);
       const next = await fetchForecastRecord(place);
-      persistForecast(next);
+      persistForecast(next, place.latitude, place.longitude);
       setRecord(next);
     } catch (err: any) {
-      const saved = loadPersistedForecast();
-      if (saved) {
-        setRecord(saved);
-        setBanner({ tone: "info", text: `${err.message || "Couldn't refresh."} Showing the last saved forecast.` });
+      if (record) {
+        setBanner({ tone: "info", text: `${err.message || "Couldn't refresh."} Showing the cached forecast for this location.` });
       } else {
         setBanner({ tone: "error", text: err.message || "Unable to get weather data." });
       }
@@ -744,8 +762,8 @@ function WeatherMapView({ location }: { location: Coordinates | null }) {
   const markerRef = useRef<any>(null);
   const [mapLayer, setMapLayer] = useState<'standard' | 'temperature' | 'precipitation' | 'wind'>('standard');
 
-  const defaultLat = location?.latitude ?? 20.5937;
-  const defaultLng = location?.longitude ?? 78.9629;
+  const defaultLat = location?.latitude ?? NEUTRAL_LAT;
+  const defaultLng = location?.longitude ?? NEUTRAL_LNG;
 
   useEffect(() => {
     if (!mapContainerRef.current || mapInstanceRef.current) return;
@@ -761,7 +779,7 @@ function WeatherMapView({ location }: { location: Coordinates | null }) {
 
       const map = L.map(mapContainerRef.current!, {
         center: [defaultLat, defaultLng],
-        zoom: 5,
+        zoom: location ? 5 : 2,
         zoomControl: true,
       });
 
@@ -770,14 +788,17 @@ function WeatherMapView({ location }: { location: Coordinates | null }) {
         maxZoom: 18,
       }).addTo(map);
 
-      // Add OpenWeatherMap weather layer (free tier)
-      // Temperature layer via Open-Meteo tile proxy
-      const rainLayer = L.tileLayer(
-        'https://tile.openweathermap.org/map/precipitation_new/{z}/{x}/{y}.png?appid=demo',
-        { opacity: 0.5, attribution: 'Weather &copy; OpenWeatherMap' }
-      );
+      // OpenWeatherMap overlay tiles only load for a real selected location —
+      // no location → no weather-tile requests (§no-location). The active
+      // overlay is applied by switchLayer below.
+      if (location) {
+        const rainLayer = L.tileLayer(
+          'https://tile.openweathermap.org/map/precipitation_new/{z}/{x}/{y}.png?appid=demo',
+          { opacity: 0.5, attribution: 'Weather &copy; OpenWeatherMap' }
+        );
 
-      (map as any)._weatherLayer = rainLayer;
+        (map as any)._weatherLayer = rainLayer;
+      }
       mapInstanceRef.current = map;
 
       if (location) {
@@ -796,19 +817,29 @@ function WeatherMapView({ location }: { location: Coordinates | null }) {
     };
   }, []);
 
-  // Update marker when location changes
+  // Update marker when location changes; location === null clears the
+  // marker and returns the map to the neutral viewport (§no-location).
   useEffect(() => {
-    if (!mapInstanceRef.current || !location) return;
+    if (!mapInstanceRef.current) return;
     import('leaflet').then((L) => {
+      const map = mapInstanceRef.current!;
+      if (!location) {
+        if (markerRef.current) {
+          markerRef.current.remove();
+          markerRef.current = null;
+        }
+        map.setView([NEUTRAL_LAT, NEUTRAL_LNG], 2);
+        return;
+      }
       if (markerRef.current) {
         markerRef.current.setLatLng([location.latitude, location.longitude]);
       } else {
         markerRef.current = L.marker([location.latitude, location.longitude])
-          .addTo(mapInstanceRef.current)
+          .addTo(map)
           .bindPopup(`📍 Your Location`)
           .openPopup();
       }
-      mapInstanceRef.current.setView([location.latitude, location.longitude], 8);
+      map.setView([location.latitude, location.longitude], 8);
     });
   }, [location]);
 
@@ -826,13 +857,14 @@ function WeatherMapView({ location }: { location: Coordinates | null }) {
         attribution: '&copy; OpenStreetMap contributors',
         maxZoom: 18,
       }).addTo(map);
-      // Overlay weather layer from Open-Meteo tile service
+      // Overlay weather layer only for a real location: no location → no
+      // weather-tile requests (§no-location).
       const overlays: Record<string, string> = {
         temperature: 'https://tile.openweathermap.org/map/temp_new/{z}/{x}/{y}.png?appid=demo',
         precipitation: 'https://tile.openweathermap.org/map/precipitation_new/{z}/{x}/{y}.png?appid=demo',
         wind: 'https://tile.openweathermap.org/map/wind_new/{z}/{x}/{y}.png?appid=demo',
       };
-      if (type !== 'standard' && overlays[type]) {
+      if (location && type !== 'standard' && overlays[type]) {
         L.tileLayer(overlays[type], { opacity: 0.55, attribution: 'Weather &copy; OpenWeatherMap' }).addTo(map);
       }
     });
@@ -918,12 +950,9 @@ function InteractiveRadarView({ location }: { location: Coordinates | null }) {
         shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
       });
 
-      const centerLat = location?.latitude ?? 20.5937;
-      const centerLng = location?.longitude ?? 78.9629;
-
       const map = L.map(mapContainerRef.current!, {
-        center: [centerLat, centerLng],
-        zoom: 5,
+        center: location ? [location.latitude, location.longitude] : [NEUTRAL_LAT, NEUTRAL_LNG],
+        zoom: location ? 5 : 2,
         zoomControl: true,
       });
 
@@ -933,19 +962,22 @@ function InteractiveRadarView({ location }: { location: Coordinates | null }) {
         maxZoom: 18,
       }).addTo(map);
 
-      // Rain/precipitation overlay
-      L.tileLayer(
-        'https://tile.openweathermap.org/map/precipitation_new/{z}/{x}/{y}.png?appid=demo',
-        { opacity: 0.65, attribution: 'Weather &copy; OpenWeatherMap' }
-      ).addTo(map);
-
-      // Clouds overlay
-      L.tileLayer(
-        'https://tile.openweathermap.org/map/clouds_new/{z}/{x}/{y}.png?appid=demo',
-        { opacity: 0.4, attribution: 'Clouds &copy; OpenWeatherMap' }
-      ).addTo(map);
-
+      // Weather overlays (precipitation, clouds) and the location marker only
+      // exist for a real selected location — no location → no weather-tile
+      // requests and no marker (§no-location).
       if (location) {
+        // Rain/precipitation overlay
+        L.tileLayer(
+          'https://tile.openweathermap.org/map/precipitation_new/{z}/{x}/{y}.png?appid=demo',
+          { opacity: 0.65, attribution: 'Weather &copy; OpenWeatherMap' }
+        ).addTo(map);
+
+        // Clouds overlay
+        L.tileLayer(
+          'https://tile.openweathermap.org/map/clouds_new/{z}/{x}/{y}.png?appid=demo',
+          { opacity: 0.4, attribution: 'Clouds &copy; OpenWeatherMap' }
+        ).addTo(map);
+
         const pulseIcon = L.divIcon({
           className: '',
           html: `<div style="width:14px;height:14px;background:rgba(240,168,60,0.9);border-radius:50%;border:2px solid white;box-shadow:0 0 0 4px rgba(240,168,60,0.3);animation:pulse 1.5s infinite"></div>`,

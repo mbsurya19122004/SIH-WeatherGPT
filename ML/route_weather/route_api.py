@@ -3,10 +3,15 @@ import requests
 OSRM_URL = "https://router.project-osrm.org/route/v1/driving"
 
 
-def get_route(origin, destination):
+def get_route(origin, destination, alternatives: bool = False):
     """
     origin and destination format:
     (latitude, longitude)
+    
+    Returns a list of routes (max 3 when alternatives=True), each with:
+    - distance_km
+    - duration_minutes
+    - coordinates (GeoJSON LineString coordinates [lon, lat])
     """
 
     origin_lat, origin_lon = origin
@@ -21,7 +26,8 @@ def get_route(origin, destination):
 
     params = {
         "overview": "full",
-        "geometries": "geojson"
+        "geometries": "geojson",
+        "alternatives": "true" if alternatives else "false",
     }
 
     response = requests.get(
@@ -42,10 +48,13 @@ def get_route(origin, destination):
             f"Routing failed: {data['code']}"
         )
 
-    route = data["routes"][0]
+    routes = data["routes"][:3]  # Limit to 3 alternatives max
 
-    return {
-        "distance_km": route["distance"] / 1000,
-        "duration_minutes": route["duration"] / 60,
-        "coordinates": route["geometry"]["coordinates"]
-    }
+    return [
+        {
+            "distance_km": route["distance"] / 1000,
+            "duration_minutes": route["duration"] / 60,
+            "coordinates": route["geometry"]["coordinates"]
+        }
+        for route in routes
+    ]

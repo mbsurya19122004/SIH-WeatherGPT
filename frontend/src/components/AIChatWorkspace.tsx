@@ -78,7 +78,55 @@ export default function AIChatWorkspace({ lang = 'en' }: { lang?: 'en' | 'hi' })
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
-      if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+      if (!response.ok) {
+        // Classify the failure instead of collapsing everything into one
+        // "couldn't connect" string. The backend distinguishes a
+        // not-configured service (503) from an unreachable model (502); the
+        // user needs to know which, because only one of them is worth
+        // retrying. Nothing internal — no URLs, provider names, keys or
+        // tracebacks — is surfaced.
+        const detail = await response
+          .json()
+          .then((d: unknown) =>
+            typeof (d as { detail?: unknown })?.detail === 'string'
+              ? (d as { detail: string }).detail
+              : '',
+          )
+          .catch(() => '');
+
+        // The backend already writes its error copy FOR THE USER. Its 503
+        // carries the real cause and when it changes ("daily limit, resets at
+        // 29 Sep 2026, 05:30 IST"), which is the only actionable fact in the
+        // whole response.
+        //
+        // This code used to read `detail`, log it, and then throw it away in
+        // favour of a hardcoded string per status. On a phone that meant the
+        // user was told "it has not been configured on this server" while the
+        // real cause was a spent daily allowance, and the reset time was
+        // discarded — sending them away to wait for a server repair that was
+        // not needed and would not help. A false cause is worse than no cause.
+        //
+        // So the detail is used when present, and the per-status string is only
+        // a fallback for a response that carries no usable detail. The
+        // operator log is kept.
+        let content: string;
+        const sayable = detail.trim();
+        if (sayable) {
+          content = sayable;
+        } else if (response.status === 502) {
+          content =
+            'The weather assistant could not reach its language model. Please try again in a moment.';
+        } else if (response.status === 400 || response.status === 422) {
+          content = 'I could not understand that request. Could you rephrase it?';
+        } else {
+          content = 'The weather assistant is unavailable right now. Please try again.';
+        }
+        // The detail is logged for operators, never shown to the user.
+        console.warn(`[agent] ${response.status}: ${detail || 'no detail'}`);
+        setMessages((prev) => [...prev, { role: 'assistant', content }]);
+        if (voiceEnabled) speak(content, undefined, locale);
+        return;
+      }
       const data = await response.json();
       const answer =
         typeof data?.message === 'string' && data.message.trim()
@@ -87,10 +135,16 @@ export default function AIChatWorkspace({ lang = 'en' }: { lang?: 'en' | 'hi' })
       setMessages((prev) => [...prev, { role: 'assistant', content: answer }]);
       if (voiceEnabled) speak(answer, undefined, locale);
     } catch {
-      console.error('Agent error:', new Error('failed to reach /agent'));
+      // Only a genuine transport failure reaches here (backend down, CORS,
+      // offline) — not an HTTP error status, which is handled above.
+      console.warn('[agent] transport failure reaching /agent');
       setMessages((prev) => [
         ...prev,
-        { role: 'assistant', content: "Sorry, I couldn't connect to the WeatherGPT agent. Please check your connection and try again." },
+        {
+          role: 'assistant',
+          content:
+            "I can't reach the weather service right now. Please check your connection and try again.",
+        },
       ]);
     } finally {
       setLoading(false);
@@ -152,11 +206,14 @@ export default function AIChatWorkspace({ lang = 'en' }: { lang?: 'en' | 'hi' })
               <div className="ai-chat-empty-mark" aria-hidden="true">
                 <CloudSun />
               </div>
-              <h2 className="ai-chat-greeting">
+              {/* The chat is the app's primary view, so this is its page-level
+                  heading and the only h1 on the route. `.ai-chat-greeting`
+                  carries the styling, so the tag change is visual-neutral. */}
+              <h1 className="ai-chat-greeting">
                 {location
                   ? `Ask anything about the weather in ${location.name}.`
                   : 'Ask anything about the weather anywhere. Choose a location from the header pill, the Weather map, or the Weather report.'}
-              </h2>
+              </h1>
 
               <div className="ai-chat-suggestion-grid">
                 {SUGGESTIONS.map((s) => {
